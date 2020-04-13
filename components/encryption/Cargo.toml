@@ -14,7 +14,7 @@ crc32fast = "1.2"
 engine_traits = { path = "../engine_traits" }
 failure = "0.1"
 hex = "0.4.2"
-kvproto = { git = "https://github.com/pingcap/kvproto.git", default-features = false }
+kvproto = { git = "https://github.com/3pointer/kvproto.git", default-features = false, branch="add_writerequest" }
 openssl = "0.10"
 protobuf = "2.8"
 rand = "0.7"

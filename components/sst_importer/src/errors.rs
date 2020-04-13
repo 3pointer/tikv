@@ -8,6 +8,7 @@ use std::result;
 
 use grpcio::Error as GrpcError;
 use kvproto::import_sstpb;
+use tikv_util::codec::Error as CodecError;
 use tokio_sync::oneshot::error::RecvError;
 use uuid::Error as UuidError;
 
@@ -28,6 +29,7 @@ pub fn error_inc(err: &Error) {
         Error::CannotReadExternalStorage(..) => "read_external_storage",
         Error::WrongKeyPrefix(..) => "wrong_prefix",
         Error::BadFormat(..) => "bad_format",
+        Error::CodecError(..) => "codec",
         _ => return,
     };
     IMPORTER_ERROR_VEC.with_label_values(&[label]).inc();
@@ -97,6 +99,11 @@ quick_error! {
         }
         BadFormat(msg: String) {
             display("bad format {}", msg)
+        }
+        CodecError(err: CodecError) {
+            from()
+            cause(err)
+            description(err.description())
         }
     }
 }

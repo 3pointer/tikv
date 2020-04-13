@@ -1,5 +1,6 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+use futures_executor::block_on;
 use std::borrow::Cow;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -12,14 +13,15 @@ use kvproto::backup::StorageBackend;
 use kvproto::import_sstpb::*;
 use uuid::{Builder as UuidBuilder, Uuid};
 
-use engine_traits::{IngestExternalFileOptions, KvEngine};
-use engine_traits::{Iterator, CF_WRITE};
+use engine_traits::SstExt;
+use engine_traits::{name_to_cf, IngestExternalFileOptions, KvEngine};
+use engine_traits::{CfName, Iterator, CF_WRITE};
 use engine_traits::{SeekKey, SstReader, SstWriter};
 use external_storage::{block_on_external_io, create_storage, url_of_backend};
 use futures_util::io::{copy, AllowStdIo};
 use keys;
 use tikv_util::time::Limiter;
-use txn_types::{Key, TimeStamp, WriteRef};
+use txn_types::{is_short_value, Key, TimeStamp, Write as KvWrite, WriteRef, WriteType};
 
 use super::{Error, Result};
 use crate::metrics::*;
@@ -37,7 +39,7 @@ impl SSTImporter {
     }
 
     pub fn get_path(&self, meta: &SstMeta) -> PathBuf {
-        let path = self.dir.join(meta).unwrap();
+        let path = self.dir.join(meta, None).unwrap();
         path.save
     }
 
@@ -134,7 +136,7 @@ impl SSTImporter {
         mut sst_writer: E::SstWriter,
     ) -> Result<Option<Range>> {
         let start = Instant::now();
-        let path = self.dir.join(meta)?;
+        let path = self.dir.join(meta, None)?;
         let url = url_of_backend(backend);
 
         // prepare to download the file from the external_storage
@@ -319,6 +321,104 @@ impl SSTImporter {
     pub fn list_ssts(&self) -> Result<Vec<SstMeta>> {
         self.dir.list_ssts()
     }
+
+    pub fn new_writer<E: KvEngine>(
+        &self,
+        default: E::SstWriter,
+        write: E::SstWriter,
+        meta: &SstMeta,
+    ) -> Result<SSTWriter<E>> {
+        let default_path = self.dir.join(meta, name_to_cf("default"))?;
+        let write_path = self.dir.join(meta, name_to_cf("write"))?;
+        Ok(SSTWriter::new(default, write, default_path, write_path))
+    }
+}
+
+pub struct SSTWriter<E: KvEngine> {
+    default: E::SstWriter,
+    default_entries: u64,
+    default_path: ImportPath,
+    write: E::SstWriter,
+    write_entries: u64,
+    write_path: ImportPath,
+}
+
+impl<E: KvEngine> SSTWriter<E> {
+    pub fn new(
+        default: E::SstWriter,
+        write: E::SstWriter,
+        default_path: ImportPath,
+        write_path: ImportPath,
+    ) -> Self {
+        SSTWriter {
+            default,
+            default_path,
+            default_entries: 0,
+            write,
+            write_path,
+            write_entries: 0,
+        }
+    }
+
+    pub fn write(&mut self, batch: WriteBatch) -> Result<()> {
+        let commit_ts = TimeStamp::new(batch.get_commit_ts());
+        for m in batch.get_mutations().iter() {
+            match m.get_op() {
+                MutationOp::Put => {
+                    let k = Key::from_raw(m.get_key()).append_ts(commit_ts);
+                    self.put(k.as_encoded(), m.get_value())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let k = keys::data_key(key);
+        let (_, commit_ts) = Key::split_on_ts_for(key)?;
+        if is_short_value(value) {
+            let w = KvWrite::new(WriteType::Put, commit_ts, Some(value.to_vec()));
+            self.write.put(&k, &w.as_ref().to_bytes())?;
+            self.write_entries += 1;
+        } else {
+            let w = KvWrite::new(WriteType::Put, commit_ts, None);
+            self.write.put(&k, &w.as_ref().to_bytes())?;
+            self.write_entries += 1;
+            self.default.put(&k, value)?;
+            self.default_entries += 1;
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<()> {
+        let (default_entries, write_entries) = (self.default_entries, self.write_entries);
+        let (p1, p2) = (self.default_path.clone(), self.write_path.clone());
+        let (w1, w2) = (self.default, self.write);
+        if default_entries > 0 {
+            let (_, sst_reader) = w1.finish_read()?;
+            SSTWriter::<E>::save(sst_reader, p1)?;
+        }
+        if write_entries > 0 {
+            let (_, sst_reader) = w2.finish_read()?;
+            SSTWriter::<E>::save(sst_reader, p2)?;
+        }
+        info!("finish write to sst with default entries: {}, write entries: {}", default_entries, write_entries);
+        Ok(())
+    }
+
+    fn save(
+        sst_reader: <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileReader,
+        import_path: ImportPath,
+    ) -> Result<()> {
+        let tmp_path = import_path.temp;
+        let mut tmp_f = AllowStdIo::new(File::create(&tmp_path)?);
+        block_on(copy(AllowStdIo::new(sst_reader), &mut tmp_f))?;
+        let tmp_f = tmp_f.into_inner();
+        tmp_f.metadata()?.permissions().set_readonly(true);
+        tmp_f.sync_all()?;
+        fs::rename(tmp_path, import_path.save)?;
+        Ok(())
+    }
 }
 
 /// ImportDir is responsible for operating SST files and related path
@@ -358,8 +458,12 @@ impl ImportDir {
         })
     }
 
-    fn join(&self, meta: &SstMeta) -> Result<ImportPath> {
-        let file_name = sst_meta_to_path(meta)?;
+    fn join(&self, meta: &SstMeta, cf: Option<CfName>) -> Result<ImportPath> {
+        let file_name = if let Some(cf) = cf {
+            sst_meta_cf_to_path(meta, cf)?
+        } else {
+            sst_meta_to_path(meta)?
+        };
         let save_path = self.root_dir.join(&file_name);
         let temp_path = self.temp_dir.join(&file_name);
         let clone_path = self.clone_dir.join(&file_name);
@@ -371,7 +475,7 @@ impl ImportDir {
     }
 
     fn create(&self, meta: &SstMeta) -> Result<ImportFile> {
-        let path = self.join(meta)?;
+        let path = self.join(meta, None)?;
         if path.save.exists() {
             return Err(Error::FileExists(path.save));
         }
@@ -379,7 +483,7 @@ impl ImportDir {
     }
 
     fn delete(&self, meta: &SstMeta) -> Result<ImportPath> {
-        let path = self.join(meta)?;
+        let path = self.join(meta, None)?;
         if path.save.exists() {
             fs::remove_file(&path.save)?;
         }
@@ -394,7 +498,7 @@ impl ImportDir {
 
     fn ingest<E: KvEngine>(&self, meta: &SstMeta, engine: &E) -> Result<()> {
         let start = Instant::now();
-        let path = self.join(meta)?;
+        let path = self.join(meta, None)?;
         let cf = meta.get_cf_name();
         let cf = engine.cf_handle(cf).expect("bad cf name");
         engine.prepare_sst_for_ingestion(&path.save, &path.clone)?;
@@ -543,6 +647,23 @@ impl fmt::Debug for ImportFile {
 
 const SST_SUFFIX: &str = ".sst";
 
+fn sst_meta_cf_to_path(meta: &SstMeta, cf: CfName) -> Result<PathBuf> {
+    let name = sst_meta_cf_to_name(meta, cf)?;
+    Ok(PathBuf::from(name))
+}
+
+fn sst_meta_cf_to_name(meta: &SstMeta, cf: CfName) -> Result<String> {
+    Ok(format!(
+        "{}_{}_{}_{}_{}{}",
+        UuidBuilder::from_slice(meta.get_uuid())?.build(),
+        meta.get_region_id(),
+        meta.get_region_epoch().get_conf_ver(),
+        meta.get_region_epoch().get_version(),
+        cf,
+        SST_SUFFIX,
+    ))
+}
+
 fn sst_meta_to_path(meta: &SstMeta) -> Result<PathBuf> {
     Ok(PathBuf::from(format!(
         "{}_{}_{}_{}{}",
@@ -631,7 +752,7 @@ mod tests {
         let mut meta = SstMeta::default();
         meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
 
-        let path = dir.join(&meta).unwrap();
+        let path = dir.join(&meta, None).unwrap();
 
         // Test ImportDir::create()
         {
@@ -924,7 +1045,7 @@ mod tests {
         assert_eq!(range.get_end(), b"t123_r13");
 
         // verifies that the file is saved to the correct place.
-        let sst_file_path = importer.dir.join(&meta).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
         let sst_file_metadata = sst_file_path.metadata().unwrap();
         assert!(sst_file_metadata.is_file());
         assert_eq!(sst_file_metadata.len(), meta.get_length());
@@ -972,7 +1093,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size may be changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1015,7 +1136,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size may be changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1057,7 +1178,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size may be changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1184,7 +1305,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size is changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1226,7 +1347,7 @@ mod tests {
         assert_eq!(range.get_end(), b"t5_r07");
 
         // verifies that the file is saved to the correct place.
-        let sst_file_path = importer.dir.join(&meta).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
