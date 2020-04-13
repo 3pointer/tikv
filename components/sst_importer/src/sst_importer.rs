@@ -1,5 +1,6 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+use futures_executor::block_on;
 use std::borrow::Cow;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -16,14 +17,14 @@ use uuid::{Builder as UuidBuilder, Uuid};
 use encryption::DataKeyManager;
 use engine_rocks::{encryption::get_env, RocksSstReader};
 use engine_traits::{
-    EncryptionKeyManager, IngestExternalFileOptions, Iterator, KvEngine, SeekKey, SstReader,
-    SstWriter, CF_WRITE,
+    EncryptionKeyManager, IngestExternalFileOptions, Iterator, KvEngine, SeekKey, SstExt,
+    SstReader, SstWriter, CF_WRITE, CF_DEFAULT,
 };
 use external_storage::{block_on_external_io, create_storage, url_of_backend};
 use futures_util::io::{copy, AllowStdIo};
 use keys;
 use tikv_util::time::Limiter;
-use txn_types::{Key, TimeStamp, WriteRef};
+use txn_types::{is_short_value, Key, TimeStamp, Write as KvWrite, WriteRef, WriteType};
 
 use super::{Error, Result};
 use crate::metrics::*;
@@ -348,6 +349,133 @@ impl SSTImporter {
     pub fn list_ssts(&self) -> Result<Vec<SstMeta>> {
         self.dir.list_ssts()
     }
+
+    pub fn new_writer<E: KvEngine>(
+        &self,
+        default: E::SstWriter,
+        write: E::SstWriter,
+        meta: SstMeta,
+    ) -> Result<SSTWriter<E>> {
+        // use new uuid to generate different default and write filename
+        let mut default_meta = meta.clone();
+        let cf = CF_DEFAULT.to_owned();
+        default_meta.set_cf_name(cf);
+        let default_path = self.dir.join(&default_meta)?;
+
+        let mut write_meta = meta.clone();
+        let cf = CF_WRITE.to_owned();
+        write_meta.set_cf_name(cf);
+        let write_path = self.dir.join(&write_meta)?;
+        Ok(SSTWriter::new(
+            default,
+            write,
+            default_path,
+            write_path,
+            default_meta,
+            write_meta,
+        ))
+    }
+}
+
+pub struct SSTWriter<E: KvEngine> {
+    default: E::SstWriter,
+    default_entries: u64,
+    default_path: ImportPath,
+    default_meta: SstMeta,
+    write: E::SstWriter,
+    write_entries: u64,
+    write_path: ImportPath,
+    write_meta: SstMeta,
+}
+
+impl<E: KvEngine> SSTWriter<E> {
+    pub fn new(
+        default: E::SstWriter,
+        write: E::SstWriter,
+        default_path: ImportPath,
+        write_path: ImportPath,
+        default_meta: SstMeta,
+        write_meta: SstMeta,
+    ) -> Self {
+        SSTWriter {
+            default,
+            default_path,
+            default_entries: 0,
+            default_meta,
+            write,
+            write_path,
+            write_entries: 0,
+            write_meta,
+        }
+    }
+
+    pub fn write(&mut self, batch: WriteBatch) -> Result<()> {
+        let commit_ts = TimeStamp::new(batch.get_commit_ts());
+        for m in batch.get_mutations().iter() {
+            match m.get_op() {
+                MutationOp::Put => {
+                    let k = Key::from_raw(m.get_key()).append_ts(commit_ts);
+                    self.put(k.as_encoded(), m.get_value())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let k = keys::data_key(key);
+        let (_, commit_ts) = Key::split_on_ts_for(key)?;
+        if is_short_value(value) {
+            let w = KvWrite::new(WriteType::Put, commit_ts, Some(value.to_vec()));
+            self.write.put(&k, &w.as_ref().to_bytes())?;
+            self.write_entries += 1;
+        } else {
+            let w = KvWrite::new(WriteType::Put, commit_ts, None);
+            self.write.put(&k, &w.as_ref().to_bytes())?;
+            self.write_entries += 1;
+            self.default.put(&k, value)?;
+            self.default_entries += 1;
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<SstMeta>> {
+        let default_meta = self.default_meta.clone();
+        let write_meta = self.write_meta.clone();
+        let mut metas = vec![];
+        let (default_entries, write_entries) = (self.default_entries, self.write_entries);
+        let (p1, p2) = (self.default_path.clone(), self.write_path.clone());
+        let (w1, w2) = (self.default, self.write);
+        if default_entries > 0 {
+            let (_, sst_reader) = w1.finish_read()?;
+            SSTWriter::<E>::save(sst_reader, p1)?;
+            metas.push(default_meta);
+        }
+        if write_entries > 0 {
+            let (_, sst_reader) = w2.finish_read()?;
+            SSTWriter::<E>::save(sst_reader, p2)?;
+            metas.push(write_meta);
+        }
+        info!(
+            "finish write to sst with default entries: {}, write entries: {}",
+            default_entries, write_entries
+        );
+        Ok(metas)
+    }
+
+    fn save(
+        sst_reader: <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileReader,
+        import_path: ImportPath,
+    ) -> Result<()> {
+        let tmp_path = import_path.temp;
+        let mut tmp_f = AllowStdIo::new(File::create(&tmp_path)?);
+        block_on(copy(AllowStdIo::new(sst_reader), &mut tmp_f))?;
+        let tmp_f = tmp_f.into_inner();
+        tmp_f.metadata()?.permissions().set_readonly(true);
+        tmp_f.sync_all()?;
+        fs::rename(tmp_path, import_path.save)?;
+        Ok(())
+    }
 }
 
 /// ImportDir is responsible for operating SST files and related path
@@ -579,11 +707,12 @@ const SST_SUFFIX: &str = ".sst";
 
 fn sst_meta_to_path(meta: &SstMeta) -> Result<PathBuf> {
     Ok(PathBuf::from(format!(
-        "{}_{}_{}_{}{}",
+        "{}_{}_{}_{}_{}{}",
         UuidBuilder::from_slice(meta.get_uuid())?.build(),
         meta.get_region_id(),
         meta.get_region_epoch().get_conf_ver(),
         meta.get_region_epoch().get_version(),
+        meta.get_cf_name(),
         SST_SUFFIX,
     )))
 }
@@ -596,12 +725,12 @@ fn path_to_sst_meta<P: AsRef<Path>>(path: P) -> Result<SstMeta> {
     };
 
     // A valid file name should be in the format:
-    // "{uuid}_{region_id}_{region_epoch.conf_ver}_{region_epoch.version}.sst"
+    // "{uuid}_{region_id}_{region_epoch.conf_ver}_{region_epoch.version}_{cf}.sst"
     if !file_name.ends_with(SST_SUFFIX) {
         return Err(Error::InvalidSSTPath(path.to_owned()));
     }
     let elems: Vec<_> = file_name.trim_end_matches(SST_SUFFIX).split('_').collect();
-    if elems.len() != 4 {
+    if elems.len() != 5 {
         return Err(Error::InvalidSSTPath(path.to_owned()));
     }
 
@@ -611,6 +740,7 @@ fn path_to_sst_meta<P: AsRef<Path>>(path: P) -> Result<SstMeta> {
     meta.set_region_id(elems[1].parse()?);
     meta.mut_region_epoch().set_conf_ver(elems[2].parse()?);
     meta.mut_region_epoch().set_version(elems[3].parse()?);
+    meta.set_cf_name(elems[4].to_owned());
     Ok(meta)
 }
 

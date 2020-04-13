@@ -3,7 +3,7 @@
 use std::f64::INFINITY;
 use std::sync::{Arc, Mutex};
 
-use engine_traits::{name_to_cf, CompactExt, MiscExt, CF_DEFAULT};
+use engine_traits::{name_to_cf, CompactExt, MiscExt, CF_DEFAULT, CF_WRITE};
 use futures::sync::mpsc;
 use futures::{future, Future, Stream};
 use futures_cpupool::{Builder, CpuPool};
@@ -11,6 +11,7 @@ use grpcio::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
 use kvproto::errorpb;
 use kvproto::import_sstpb::*;
 use kvproto::raft_cmdpb::*;
+use protobuf::RepeatedField;
 
 use crate::server::CONFIG_ROCKSDB_GAUGE;
 use engine_rocks::RocksEngine;
@@ -358,6 +359,79 @@ impl<Router: RaftStoreRouter<RocksEngine>> ImportSst for ImportSSTService<Router
         ctx.spawn(
             future::ok::<_, Error>(SetDownloadSpeedLimitResponse::default())
                 .then(move |res| send_rpc_response!(res, sink, label, timer)),
+        )
+    }
+
+    fn write(
+        &mut self,
+        ctx: RpcContext<'_>,
+        stream: RequestStream<WriteRequest>,
+        sink: ClientStreamingSink<WriteResponse>,
+    ) {
+        if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }
+        let label = "write";
+        let timer = Instant::now_coarse();
+        let import = Arc::clone(&self.importer);
+        let engine = self.engine.clone();
+        let bounded_stream = mpsc::spawn(stream, &self.threads, self.cfg.stream_channel_window);
+        ctx.spawn(
+            self.threads.spawn(
+                bounded_stream
+                    .into_future()
+                    .map_err(|(e, _)| Error::from(e))
+                    .and_then(move |(chunk, stream)| {
+                        let meta = match chunk {
+                            Some(ref chunk) if chunk.has_meta() => chunk.get_meta(),
+                            _ => return Err(Error::InvalidChunk),
+                        };
+                        let name = import.get_path(meta);
+
+                        let default = <RocksEngine as SstExt>::SstWriterBuilder::new()
+                            .set_in_memory(true)
+                            .set_db(&engine)
+                            .set_cf(CF_DEFAULT)
+                            .build(&name.to_str().unwrap())?;
+                        let write = <RocksEngine as SstExt>::SstWriterBuilder::new()
+                            .set_in_memory(true)
+                            .set_db(&engine)
+                            .set_cf(CF_WRITE)
+                            .build(&name.to_str().unwrap())?;
+                        let writer = match import.new_writer::<RocksEngine>(default, write, meta.to_owned()) {
+                            Ok(w) => {
+                                w
+                            },
+                            Err(e) => {
+                                error!("build writer failed {:?}", e);
+                                return Err(Error::InvalidChunk)
+                            }
+                        };
+                        Ok((writer, stream))
+                    })
+                    .and_then(move |(writer, stream)| {
+                        stream
+                            .map_err(Error::from)
+                            .fold(writer, |mut writer, mut chunk| {
+                                let _start = Instant::now_coarse();
+                                if !chunk.has_batch() {
+                                    return Err(Error::InvalidChunk);
+                                }
+                                let batch = chunk.take_batch();
+                                writer.write(batch)?;
+                                Ok(writer)
+                            }).and_then(|writer| writer.finish())
+                    })
+                    .then(move |res| match res {
+                        Ok(metas) => {
+                            let mut resp = WriteResponse::default();
+                            resp.set_metas(RepeatedField::from_vec(metas));
+                            Ok(resp)
+                        }
+                        Err(e) => Err(e),
+                    })
+                    .then(move |res| send_rpc_response!(res, sink, label, timer)),
+            ),
         )
     }
 }
