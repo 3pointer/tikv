@@ -11,6 +11,7 @@ use grpcio::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
 use kvproto::errorpb;
 use kvproto::import_sstpb::*;
 use kvproto::raft_cmdpb::*;
+use protobuf::RepeatedField;
 
 use crate::server::CONFIG_ROCKSDB_GAUGE;
 use engine_rocks::RocksEngine;
@@ -401,23 +402,23 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                             import.new_writer::<RocksEngine>(default, write, meta.to_owned())?;
                         Ok((writer, stream))
                     })
-                    .and_then(move |(mut writer, stream)| {
-                        let writer_ref = &mut writer;
-                        stream.map_err(Error::from).for_each(move |mut chunk| {
-                            let _start = Instant::now_coarse();
-                            if !chunk.has_batch() {
-                                return Err(Error::InvalidChunk);
-                            }
-                            let batch = chunk.take_batch();
-                            writer_ref.write(batch)?;
-                            Ok(())
-                        });
-                        writer.finish()
+                    .and_then(move |(writer, stream)| {
+                        stream
+                            .map_err(Error::from)
+                            .fold(writer, |mut writer, mut chunk| {
+                                let _start = Instant::now_coarse();
+                                if !chunk.has_batch() {
+                                    return Err(Error::InvalidChunk);
+                                }
+                                let batch = chunk.take_batch();
+                                writer.write(batch)?;
+                                Ok(writer)
+                            }).and_then(|writer| writer.finish())
                     })
                     .then(move |res| match res {
                         Ok(metas) => {
                             let mut resp = WriteResponse::default();
-                            resp.set_metas(metas.into());
+                            resp.set_metas(RepeatedField::from_vec(metas));
                             Ok(resp)
                         }
                         Err(e) => Err(e),
