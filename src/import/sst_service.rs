@@ -385,32 +385,35 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                             Some(ref chunk) if chunk.has_meta() => chunk.get_meta(),
                             _ => return Err(Error::InvalidChunk),
                         };
-                        Ok((meta.clone(), stream))
-                    })
-                    .and_then(move |(meta, stream)| {
-                        stream.map_err(Error::from).for_each(move |mut chunk| {
-                            let start = Instant::now_coarse();
-                            if !chunk.has_batch() {
-                                return Err(Error::InvalidChunk);
-                            }
-                            let batch = chunk.take_batch();
-                            let name = import.get_path(&meta);
+                        let name = import.get_path(meta);
 
-                            let default = <RocksEngine as SstExt>::SstWriterBuilder::new()
-                                .set_in_memory(true)
-                                .set_db(&engine)
-                                .set_cf(CF_DEFAULT)
-                                .build(&name.to_str().unwrap())?;
-                            let write = <RocksEngine as SstExt>::SstWriterBuilder::new()
-                                .set_in_memory(true)
-                                .set_db(&engine)
-                                .set_cf(CF_WRITE)
-                                .build(&name.to_str().unwrap())?;
-                            let mut writer =
-                                import.new_writer::<RocksEngine>(default, write, &meta)?;
-                            writer.write(batch)?;
-                            writer.finish()
-                        })
+                        let default = <RocksEngine as SstExt>::SstWriterBuilder::new()
+                            .set_in_memory(true)
+                            .set_db(&engine)
+                            .set_cf(CF_DEFAULT)
+                            .build(&name.to_str().unwrap())?;
+                        let write = <RocksEngine as SstExt>::SstWriterBuilder::new()
+                            .set_in_memory(true)
+                            .set_db(&engine)
+                            .set_cf(CF_WRITE)
+                            .build(&name.to_str().unwrap())?;
+                        let writer = import.new_writer::<RocksEngine>(default, write, meta)?;
+                        Ok((writer, stream))
+                    })
+                    .and_then(move |(mut writer, stream)| {
+                        let writer_ref = &mut writer;
+                        stream
+                            .map_err(Error::from)
+                            .for_each(move |mut chunk| {
+                                let _start = Instant::now_coarse();
+                                if !chunk.has_batch() {
+                                    return Err(Error::InvalidChunk);
+                                }
+                                let batch = chunk.take_batch();
+                                writer_ref.write(batch)?;
+                                Ok(())
+                            });
+                        writer.finish()
                     })
                     .then(move |res| match res {
                         Ok(_) => Ok(WriteResponse::default()),
