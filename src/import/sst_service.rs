@@ -397,26 +397,29 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                             .set_db(&engine)
                             .set_cf(CF_WRITE)
                             .build(&name.to_str().unwrap())?;
-                        let writer = import.new_writer::<RocksEngine>(default, write, meta)?;
+                        let writer =
+                            import.new_writer::<RocksEngine>(default, write, meta.to_owned())?;
                         Ok((writer, stream))
                     })
                     .and_then(move |(mut writer, stream)| {
                         let writer_ref = &mut writer;
-                        stream
-                            .map_err(Error::from)
-                            .for_each(move |mut chunk| {
-                                let _start = Instant::now_coarse();
-                                if !chunk.has_batch() {
-                                    return Err(Error::InvalidChunk);
-                                }
-                                let batch = chunk.take_batch();
-                                writer_ref.write(batch)?;
-                                Ok(())
-                            });
+                        stream.map_err(Error::from).for_each(move |mut chunk| {
+                            let _start = Instant::now_coarse();
+                            if !chunk.has_batch() {
+                                return Err(Error::InvalidChunk);
+                            }
+                            let batch = chunk.take_batch();
+                            writer_ref.write(batch)?;
+                            Ok(())
+                        });
                         writer.finish()
                     })
                     .then(move |res| match res {
-                        Ok(_) => Ok(WriteResponse::default()),
+                        Ok(metas) => {
+                            let mut resp = WriteResponse::default();
+                            resp.set_metas(metas.into());
+                            Ok(resp)
+                        }
                         Err(e) => Err(e),
                     })
                     .then(move |res| send_rpc_response!(res, sink, label, timer)),

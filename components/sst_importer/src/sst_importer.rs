@@ -14,8 +14,8 @@ use kvproto::import_sstpb::*;
 use uuid::{Builder as UuidBuilder, Uuid};
 
 use engine_traits::SstExt;
-use engine_traits::{name_to_cf, IngestExternalFileOptions, KvEngine};
-use engine_traits::{CfName, Iterator, CF_WRITE};
+use engine_traits::{IngestExternalFileOptions, KvEngine};
+use engine_traits::{Iterator, CF_WRITE};
 use engine_traits::{SeekKey, SstReader, SstWriter};
 use external_storage::{block_on_external_io, create_storage, url_of_backend};
 use futures_util::io::{copy, AllowStdIo};
@@ -39,7 +39,7 @@ impl SSTImporter {
     }
 
     pub fn get_path(&self, meta: &SstMeta) -> PathBuf {
-        let path = self.dir.join(meta, None).unwrap();
+        let path = self.dir.join(meta).unwrap();
         path.save
     }
 
@@ -136,7 +136,7 @@ impl SSTImporter {
         mut sst_writer: E::SstWriter,
     ) -> Result<Option<Range>> {
         let start = Instant::now();
-        let path = self.dir.join(meta, None)?;
+        let path = self.dir.join(meta)?;
         let url = url_of_backend(backend);
 
         // prepare to download the file from the external_storage
@@ -326,11 +326,24 @@ impl SSTImporter {
         &self,
         default: E::SstWriter,
         write: E::SstWriter,
-        meta: &SstMeta,
+        meta: SstMeta,
     ) -> Result<SSTWriter<E>> {
-        let default_path = self.dir.join(meta, name_to_cf("default"))?;
-        let write_path = self.dir.join(meta, name_to_cf("write"))?;
-        Ok(SSTWriter::new(default, write, default_path, write_path))
+        // use new uuid to generate different default and write filename
+        let mut default_meta = meta.clone();
+        default_meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
+        let default_path = self.dir.join(&default_meta)?;
+
+        let mut write_meta = meta.clone();
+        write_meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
+        let write_path = self.dir.join(&write_meta)?;
+        Ok(SSTWriter::new(
+            default,
+            write,
+            default_path,
+            write_path,
+            default_meta,
+            write_meta,
+        ))
     }
 }
 
@@ -338,9 +351,11 @@ pub struct SSTWriter<E: KvEngine> {
     default: E::SstWriter,
     default_entries: u64,
     default_path: ImportPath,
+    default_meta: SstMeta,
     write: E::SstWriter,
     write_entries: u64,
     write_path: ImportPath,
+    write_meta: SstMeta,
 }
 
 impl<E: KvEngine> SSTWriter<E> {
@@ -349,14 +364,18 @@ impl<E: KvEngine> SSTWriter<E> {
         write: E::SstWriter,
         default_path: ImportPath,
         write_path: ImportPath,
+        default_meta: SstMeta,
+        write_meta: SstMeta,
     ) -> Self {
         SSTWriter {
             default,
             default_path,
             default_entries: 0,
+            default_meta,
             write,
             write_path,
             write_entries: 0,
+            write_meta,
         }
     }
 
@@ -390,7 +409,8 @@ impl<E: KvEngine> SSTWriter<E> {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<()> {
+    pub fn finish(self) -> Result<Vec<SstMeta>> {
+        let metas = vec![self.default_meta.clone(), self.write_meta.clone()];
         let (default_entries, write_entries) = (self.default_entries, self.write_entries);
         let (p1, p2) = (self.default_path.clone(), self.write_path.clone());
         let (w1, w2) = (self.default, self.write);
@@ -402,8 +422,11 @@ impl<E: KvEngine> SSTWriter<E> {
             let (_, sst_reader) = w2.finish_read()?;
             SSTWriter::<E>::save(sst_reader, p2)?;
         }
-        info!("finish write to sst with default entries: {}, write entries: {}", default_entries, write_entries);
-        Ok(())
+        info!(
+            "finish write to sst with default entries: {}, write entries: {}",
+            default_entries, write_entries
+        );
+        Ok(metas)
     }
 
     fn save(
@@ -458,12 +481,8 @@ impl ImportDir {
         })
     }
 
-    fn join(&self, meta: &SstMeta, cf: Option<CfName>) -> Result<ImportPath> {
-        let file_name = if let Some(cf) = cf {
-            sst_meta_cf_to_path(meta, cf)?
-        } else {
-            sst_meta_to_path(meta)?
-        };
+    fn join(&self, meta: &SstMeta) -> Result<ImportPath> {
+        let file_name = sst_meta_to_path(meta)?;
         let save_path = self.root_dir.join(&file_name);
         let temp_path = self.temp_dir.join(&file_name);
         let clone_path = self.clone_dir.join(&file_name);
@@ -475,7 +494,7 @@ impl ImportDir {
     }
 
     fn create(&self, meta: &SstMeta) -> Result<ImportFile> {
-        let path = self.join(meta, None)?;
+        let path = self.join(meta)?;
         if path.save.exists() {
             return Err(Error::FileExists(path.save));
         }
@@ -483,7 +502,7 @@ impl ImportDir {
     }
 
     fn delete(&self, meta: &SstMeta) -> Result<ImportPath> {
-        let path = self.join(meta, None)?;
+        let path = self.join(meta)?;
         if path.save.exists() {
             fs::remove_file(&path.save)?;
         }
@@ -498,7 +517,7 @@ impl ImportDir {
 
     fn ingest<E: KvEngine>(&self, meta: &SstMeta, engine: &E) -> Result<()> {
         let start = Instant::now();
-        let path = self.join(meta, None)?;
+        let path = self.join(meta)?;
         let cf = meta.get_cf_name();
         let cf = engine.cf_handle(cf).expect("bad cf name");
         engine.prepare_sst_for_ingestion(&path.save, &path.clone)?;
@@ -647,23 +666,6 @@ impl fmt::Debug for ImportFile {
 
 const SST_SUFFIX: &str = ".sst";
 
-fn sst_meta_cf_to_path(meta: &SstMeta, cf: CfName) -> Result<PathBuf> {
-    let name = sst_meta_cf_to_name(meta, cf)?;
-    Ok(PathBuf::from(name))
-}
-
-fn sst_meta_cf_to_name(meta: &SstMeta, cf: CfName) -> Result<String> {
-    Ok(format!(
-        "{}_{}_{}_{}_{}{}",
-        UuidBuilder::from_slice(meta.get_uuid())?.build(),
-        meta.get_region_id(),
-        meta.get_region_epoch().get_conf_ver(),
-        meta.get_region_epoch().get_version(),
-        cf,
-        SST_SUFFIX,
-    ))
-}
-
 fn sst_meta_to_path(meta: &SstMeta) -> Result<PathBuf> {
     Ok(PathBuf::from(format!(
         "{}_{}_{}_{}{}",
@@ -752,7 +754,7 @@ mod tests {
         let mut meta = SstMeta::default();
         meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
 
-        let path = dir.join(&meta, None).unwrap();
+        let path = dir.join(&meta).unwrap();
 
         // Test ImportDir::create()
         {
@@ -1045,7 +1047,7 @@ mod tests {
         assert_eq!(range.get_end(), b"t123_r13");
 
         // verifies that the file is saved to the correct place.
-        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta).unwrap().save;
         let sst_file_metadata = sst_file_path.metadata().unwrap();
         assert!(sst_file_metadata.is_file());
         assert_eq!(sst_file_metadata.len(), meta.get_length());
@@ -1093,7 +1095,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size may be changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1136,7 +1138,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size may be changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1178,7 +1180,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size may be changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1305,7 +1307,7 @@ mod tests {
 
         // verifies that the file is saved to the correct place.
         // (the file size is changed, so not going to check the file size)
-        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
@@ -1347,7 +1349,7 @@ mod tests {
         assert_eq!(range.get_end(), b"t5_r07");
 
         // verifies that the file is saved to the correct place.
-        let sst_file_path = importer.dir.join(&meta, None).unwrap().save;
+        let sst_file_path = importer.dir.join(&meta).unwrap().save;
         assert!(sst_file_path.is_file());
 
         // verifies the SST content is correct.
