@@ -410,17 +410,21 @@ impl<E: KvEngine> SSTWriter<E> {
     }
 
     pub fn finish(self) -> Result<Vec<SstMeta>> {
-        let metas = vec![self.default_meta.clone(), self.write_meta.clone()];
+        let default_meta = self.default_meta.clone();
+        let write_meta = self.write_meta.clone();
+        let mut metas = vec![];
         let (default_entries, write_entries) = (self.default_entries, self.write_entries);
         let (p1, p2) = (self.default_path.clone(), self.write_path.clone());
         let (w1, w2) = (self.default, self.write);
         if default_entries > 0 {
             let (_, sst_reader) = w1.finish_read()?;
             SSTWriter::<E>::save(sst_reader, p1)?;
+            metas.push(default_meta);
         }
         if write_entries > 0 {
             let (_, sst_reader) = w2.finish_read()?;
             SSTWriter::<E>::save(sst_reader, p2)?;
+            metas.push(write_meta);
         }
         info!(
             "finish write to sst with default entries: {}, write entries: {}",
