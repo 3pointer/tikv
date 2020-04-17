@@ -331,10 +331,12 @@ impl SSTImporter {
         // use new uuid to generate different default and write filename
         let mut default_meta = meta.clone();
         default_meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
+        default_meta.set_cf_name("default".to_string());
         let default_path = self.dir.join(&default_meta)?;
 
         let mut write_meta = meta.clone();
         write_meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
+        write_meta.set_cf_name("write".to_string());
         let write_path = self.dir.join(&write_meta)?;
         Ok(SSTWriter::new(
             default,
