@@ -398,8 +398,15 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                             .set_db(&engine)
                             .set_cf(CF_WRITE)
                             .build(&name.to_str().unwrap())?;
-                        let writer =
-                            import.new_writer::<RocksEngine>(default, write, meta.to_owned())?;
+                        let writer = match import.new_writer::<RocksEngine>(default, write, meta.to_owned()) {
+                            Ok(w) => {
+                                w
+                            },
+                            Err(e) => {
+                                error!("build writer failed {:?}", e);
+                                return Err(Error::InvalidChunk)
+                            }
+                        };
                         Ok((writer, stream))
                     })
                     .and_then(move |(writer, stream)| {

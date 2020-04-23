@@ -330,22 +330,12 @@ impl SSTImporter {
     ) -> Result<SSTWriter<E>> {
         // use new uuid to generate different default and write filename
         let mut default_meta = meta.clone();
-        let uuid = default_meta.get_uuid();
         let cf = CF_DEFAULT.to_owned();
-        {
-            let new_uuid = [uuid, cf.as_bytes()].concat();
-            default_meta.set_uuid(new_uuid);
-        }
         default_meta.set_cf_name(cf);
         let default_path = self.dir.join(&default_meta)?;
 
         let mut write_meta = meta.clone();
-        let uuid = write_meta.get_uuid();
         let cf = CF_WRITE.to_owned();
-        {
-            let new_uuid = [uuid, cf.as_bytes()].concat();
-            write_meta.set_uuid(new_uuid);
-        }
         write_meta.set_cf_name(cf);
         let write_path = self.dir.join(&write_meta)?;
         Ok(SSTWriter::new(
@@ -393,6 +383,7 @@ impl<E: KvEngine> SSTWriter<E> {
 
     pub fn write(&mut self, batch: WriteBatch) -> Result<()> {
         let commit_ts = TimeStamp::new(batch.get_commit_ts());
+        info!("in write commit ts: {}", commit_ts);
         for m in batch.get_mutations().iter() {
             match m.get_op() {
                 MutationOp::Put => {
@@ -401,6 +392,7 @@ impl<E: KvEngine> SSTWriter<E> {
                 }
             }
         }
+        info!("finish write with commit ts: {}", commit_ts);
         Ok(())
     }
 
@@ -684,11 +676,12 @@ const SST_SUFFIX: &str = ".sst";
 
 fn sst_meta_to_path(meta: &SstMeta) -> Result<PathBuf> {
     Ok(PathBuf::from(format!(
-        "{}_{}_{}_{}{}",
+        "{}_{}_{}_{}_{}{}",
         UuidBuilder::from_slice(meta.get_uuid())?.build(),
         meta.get_region_id(),
         meta.get_region_epoch().get_conf_ver(),
         meta.get_region_epoch().get_version(),
+        meta.get_cf_name(),
         SST_SUFFIX,
     )))
 }
@@ -701,12 +694,12 @@ fn path_to_sst_meta<P: AsRef<Path>>(path: P) -> Result<SstMeta> {
     };
 
     // A valid file name should be in the format:
-    // "{uuid}_{region_id}_{region_epoch.conf_ver}_{region_epoch.version}.sst"
+    // "{uuid}_{region_id}_{region_epoch.conf_ver}_{region_epoch.version}_{cf}.sst"
     if !file_name.ends_with(SST_SUFFIX) {
         return Err(Error::InvalidSSTPath(path.to_owned()));
     }
     let elems: Vec<_> = file_name.trim_end_matches(SST_SUFFIX).split('_').collect();
-    if elems.len() != 4 {
+    if elems.len() != 5 {
         return Err(Error::InvalidSSTPath(path.to_owned()));
     }
 
@@ -716,6 +709,7 @@ fn path_to_sst_meta<P: AsRef<Path>>(path: P) -> Result<SstMeta> {
     meta.set_region_id(elems[1].parse()?);
     meta.mut_region_epoch().set_conf_ver(elems[2].parse()?);
     meta.mut_region_epoch().set_version(elems[3].parse()?);
+    meta.set_cf_name(elems[4].parse()?);
     Ok(meta)
 }
 
