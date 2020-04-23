@@ -15,7 +15,7 @@ use uuid::{Builder as UuidBuilder, Uuid};
 
 use engine_traits::SstExt;
 use engine_traits::{IngestExternalFileOptions, KvEngine};
-use engine_traits::{Iterator, CF_WRITE};
+use engine_traits::{Iterator, CF_WRITE, CF_DEFAULT};
 use engine_traits::{SeekKey, SstReader, SstWriter};
 use external_storage::{block_on_external_io, create_storage, url_of_backend};
 use futures_util::io::{copy, AllowStdIo};
@@ -330,13 +330,23 @@ impl SSTImporter {
     ) -> Result<SSTWriter<E>> {
         // use new uuid to generate different default and write filename
         let mut default_meta = meta.clone();
-        default_meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
-        default_meta.set_cf_name("default".to_string());
+        let uuid = default_meta.get_uuid();
+        let cf = CF_DEFAULT.to_owned();
+        {
+            let new_uuid = [uuid, cf.as_bytes()].concat();
+            default_meta.set_uuid(new_uuid);
+        }
+        default_meta.set_cf_name(cf);
         let default_path = self.dir.join(&default_meta)?;
 
         let mut write_meta = meta.clone();
-        write_meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
-        write_meta.set_cf_name("write".to_string());
+        let uuid = write_meta.get_uuid();
+        let cf = CF_WRITE.to_owned();
+        {
+            let new_uuid = [uuid, cf.as_bytes()].concat();
+            write_meta.set_uuid(new_uuid);
+        }
+        write_meta.set_cf_name(cf);
         let write_path = self.dir.join(&write_meta)?;
         Ok(SSTWriter::new(
             default,
