@@ -14,6 +14,7 @@ use std::io;
 use std::marker::Unpin;
 use std::path::Path;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use futures_io::AsyncRead;
 #[cfg(feature = "protobuf-codec")]
@@ -34,6 +35,35 @@ mod util;
 pub use util::block_on_external_io;
 
 pub const READ_BUF_SIZE: usize = 1024 * 1024 * 2;
+
+#[derive(Default)]
+pub struct StorageManager {
+    local_storage_cache: HashMap<str, Arc<dyn ExternalStorage>>
+}
+
+impl StorageManager {
+    pub fn new() -> Result<StorageManager> {
+        StorageManager {
+            local_storage_cache: HashMap::new()
+        }
+    }
+
+    pub fn get_storage(self, backend: &StorageBackend) -> io::Result<Arc<dyn ExternalStorage>> {
+        match &backend.backend {
+            Some(Backend::Local(local)) => {
+                let p = Path::new(&local.path);
+                if Some(s) = self.local_storage_cache.get(p.as_str()) {
+                    Ok(s)
+                } else {
+                    let s = LocalStorage::new(p).map(|s| Arc::new(s) as _);
+                    self.local_storage_cache.insert(p.as_str(), s);
+                    s
+                }
+            }
+            _ => create_storage(backend)
+        }
+    }
+}
 
 /// Create a new storage from the given storage backend description.
 pub fn create_storage(backend: &StorageBackend) -> io::Result<Arc<dyn ExternalStorage>> {

@@ -94,6 +94,7 @@ impl Task {
     /// Create a backup task based on the given backup request.
     pub fn new(
         req: BackupRequest,
+        storage: Arc<dyn ExternalStorage>,
         resp: UnboundedSender<BackupResponse>,
     ) -> Result<(Task, Arc<AtomicBool>)> {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -107,9 +108,6 @@ impl Task {
         let cf = name_to_cf(req.get_cf()).ok_or_else(|| crate::Error::InvalidCf {
             cf: req.get_cf().to_owned(),
         })?;
-
-        // Check storage backend eagerly.
-        let storage = create_storage(req.get_storage_backend())?;
 
         let task = Task {
             request: Request {

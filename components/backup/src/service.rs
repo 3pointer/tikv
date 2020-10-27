@@ -6,6 +6,7 @@ use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
 use grpcio::{self, *};
 use kvproto::backup::*;
 use security::{check_common_name, SecurityManager};
+use external_storage::*;
 use tikv_util::worker::*;
 
 use super::Task;
@@ -15,14 +16,16 @@ use super::Task;
 pub struct Service {
     scheduler: Scheduler<Task>,
     security_mgr: Arc<SecurityManager>,
+    storage_mgr: Arc<StorageManger>,
 }
 
 impl Service {
     /// Create a new backup service.
-    pub fn new(scheduler: Scheduler<Task>, security_mgr: Arc<SecurityManager>) -> Service {
+    pub fn new(scheduler: Scheduler<Task>, security_mgr: Arc<SecurityManager>, storage_mgr: Arc<StorageManger>) -> Service {
         Service {
             scheduler,
             security_mgr,
+            storage_mgr,
         }
     }
 }
@@ -40,7 +43,8 @@ impl Backup for Service {
         let mut cancel = None;
         // TODO: make it a bounded channel.
         let (tx, rx) = mpsc::unbounded();
-        if let Err(status) = match Task::new(req, tx) {
+        let storgae = self.storage_mgr.get_storage(req.get_storage_backend())?;
+        if let Err(status) = match Task::new(req, storage, tx) {
             Ok((task, c)) => {
                 cancel = Some(c);
                 self.scheduler.schedule(task).map_err(|e| {
