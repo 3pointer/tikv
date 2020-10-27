@@ -40,7 +40,7 @@ impl Backup for Service {
         let mut cancel = None;
         // TODO: make it a bounded channel.
         let (tx, rx) = mpsc::unbounded();
-        if let Err(status) = match Task::new(req, storage, tx) {
+        if let Err(status) = match Task::new(req, tx) {
             Ok((task, c)) => {
                 cancel = Some(c);
                 self.scheduler.schedule(task).map_err(|e| {

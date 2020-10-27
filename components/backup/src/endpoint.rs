@@ -93,7 +93,6 @@ impl Task {
     /// Create a backup task based on the given backup request.
     pub fn new(
         req: BackupRequest,
-        storage: Arc<dyn ExternalStorage>,
         resp: UnboundedSender<BackupResponse>,
     ) -> Result<(Task, Arc<AtomicBool>)> {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -122,7 +121,6 @@ impl Task {
                 compression_type: req.get_compression_type(),
                 compression_level: req.get_compression_level(),
             },
-            storage,
             resp,
         };
         Ok((task, cancel))
@@ -397,6 +395,8 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider> {
     db: Arc<DB>,
     config_manager: ConfigManager,
     concurrency_manager: ConcurrencyManager,
+    storage_manager: StorageManager,
+
 
     pub(crate) engine: E,
     pub(crate) region_info: R,
@@ -667,12 +667,13 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
             if branges.is_empty() {
                 return;
             }
+	    let backend = self.storage_manager.get_storage(&request.backend).unwrap();
 
             tikv_alloc::add_thread_memory_accessor();
 
             let storage = LimitedStorage {
                 limiter: request.limiter.clone(),
-                storage: self.storage_manager.get_storage(request.backend).unwrap(),
+                storage: backend,
             };
             for brange in branges {
                 if request.cancel.load(Ordering::SeqCst) {

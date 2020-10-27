@@ -12,7 +12,7 @@ extern crate tikv_alloc;
 
 use std::io;
 use std::marker::Unpin;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::collections::HashMap;
 
@@ -38,26 +38,26 @@ pub const READ_BUF_SIZE: usize = 1024 * 1024 * 2;
 
 #[derive(Default)]
 pub struct StorageManager {
-    local_storage_cache: HashMap<str, Arc<dyn ExternalStorage>>
+    local_storage_cache: HashMap<PathBuf, Arc<dyn ExternalStorage>>
 }
 
 impl StorageManager {
-    pub fn new() -> io::Result<StorageManager> {
+    pub fn new() -> StorageManager {
         StorageManager {
             local_storage_cache: HashMap::new()
         }
     }
 
-    pub fn get_storage(self, backend: &StorageBackend) -> io::Result<Arc<dyn ExternalStorage>> {
+    pub fn get_storage(&mut self, backend: &StorageBackend) -> io::Result<Arc<dyn ExternalStorage>> {
         match &backend.backend {
             Some(Backend::Local(local)) => {
                 let p = Path::new(&local.path);
-                if let Some(s) = self.local_storage_cache.get(p.as_str()) {
-                    Ok(s)
+                if let Some(s) = self.local_storage_cache.get(&p.to_path_buf()) {
+                    Ok(s.clone())
                 } else {
-                    let s = LocalStorage::new(p).map(|s| Arc::new(s) as _);
-                    self.local_storage_cache.insert(p.as_str(), s.clone());
-                    s
+                    let s: Arc<dyn ExternalStorage>  = LocalStorage::new(p).map(|s| Arc::new(s) as _).unwrap();
+                    self.local_storage_cache.insert(p.to_path_buf(), s.clone());
+                    Ok(s)
                 }
             }
             _ => create_storage(backend)
