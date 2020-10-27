@@ -42,7 +42,7 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
-    pub fn new() -> Result<StorageManager> {
+    pub fn new() -> io::Result<StorageManager> {
         StorageManager {
             local_storage_cache: HashMap::new()
         }
@@ -52,11 +52,11 @@ impl StorageManager {
         match &backend.backend {
             Some(Backend::Local(local)) => {
                 let p = Path::new(&local.path);
-                if Some(s) = self.local_storage_cache.get(p.as_str()) {
+                if let Some(s) = self.local_storage_cache.get(p.as_str()) {
                     Ok(s)
                 } else {
                     let s = LocalStorage::new(p).map(|s| Arc::new(s) as _);
-                    self.local_storage_cache.insert(p.as_str(), s);
+                    self.local_storage_cache.insert(p.as_str(), s.clone());
                     s
                 }
             }
