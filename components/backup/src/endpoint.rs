@@ -61,7 +61,6 @@ struct Request {
 /// Backup Task.
 pub struct Task {
     request: Request,
-    storage: Arc<dyn ExternalStorage>,
     pub(crate) resp: UnboundedSender<BackupResponse>,
 }
 
@@ -614,6 +613,7 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
         db: Arc<DB>,
         config: BackupConfig,
         concurrency_manager: ConcurrencyManager,
+        storage_manager: StorageManager,
     ) -> Endpoint<E, R> {
         Endpoint {
             store_id,
@@ -624,6 +624,7 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
             db,
             config_manager: ConfigManager(Arc::new(RwLock::new(config))),
             concurrency_manager,
+            storage_manager,
         }
     }
 
@@ -641,7 +642,6 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
         &self,
         prs: Arc<Mutex<Progress<R>>>,
         request: Request,
-        backend: Arc<dyn ExternalStorage>,
         tx: UnboundedSender<BackupResponse>,
     ) {
         let start_ts = request.start_ts;
@@ -670,10 +670,9 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
 
             tikv_alloc::add_thread_memory_accessor();
 
-            // Storage backend has been checked in `Task::new()`.
             let storage = LimitedStorage {
                 limiter: request.limiter.clone(),
-                storage: backend.clone(),
+                storage: self.storage_manager.get_storage(request.backend).unwrap(),
             };
             for brange in branges {
                 if request.cancel.load(Ordering::SeqCst) {
@@ -771,7 +770,7 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
     }
 
     pub fn handle_backup_task(&self, task: Task) {
-        let Task { request, storage, resp } = task;
+        let Task { request, resp } = task;
         let is_raw_kv = request.is_raw_kv;
         let start_key = if request.start_key.is_empty() {
             None
@@ -804,7 +803,7 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
         let concurrency = self.config_manager.0.read().unwrap().num_threads;
         self.pool.borrow_mut().adjust_with(concurrency);
         for _ in 0..concurrency {
-            self.spawn_backup_worker(prs.clone(), request.clone(), storage.clone(), resp.clone());
+            self.spawn_backup_worker(prs.clone(), request.clone(), resp.clone());
         }
     }
 }

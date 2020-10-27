@@ -24,6 +24,7 @@ use engine_rocks::{encryption::get_env, RocksEngine};
 use engine_traits::{
     compaction_job::CompactionJobInfo, Engines, MetricsFlusher, RaftEngine, CF_DEFAULT, CF_WRITE,
 };
+use external_storage::StorageManager;
 use fs2::FileExt;
 use futures::executor::block_on;
 use kvproto::{
@@ -771,6 +772,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             engines.engines.kv.as_inner().clone(),
             self.config.backup.clone(),
             self.concurrency_manager.clone(),
+            StorageManager::new(),
         );
         self.cfg_controller.as_mut().unwrap().register(
             tikv::config::Module::Backup,
