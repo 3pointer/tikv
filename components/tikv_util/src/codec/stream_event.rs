@@ -1,13 +1,13 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
+use crate::Either;
 use bytes::{Buf, Bytes};
 use std::io::prelude::*;
 use std::io::Cursor;
-use tikv_util::Either;
 
-pub struct Encoder;
+#[derive(Clone)]
+pub struct EventEncoder;
 
-impl Encoder {
-    // TODO move this function to a indepentent module.
+impl EventEncoder {
     pub fn encode_event<'e>(key: &'e [u8], value: &'e [u8]) -> [impl AsRef<[u8]> + 'e; 4] {
         let key_len = (key.len() as u32).to_le_bytes();
         let val_len = (value.len() as u32).to_le_bytes();
@@ -19,9 +19,8 @@ impl Encoder {
         ]
     }
 
-    #[allow(dead_code)]
     pub fn decode_event(e: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut buf = Cursor::new(Bytes::from(e));
+        let mut buf = Cursor::new(Bytes::from(e.to_vec()));
         let len = buf.get_u32_le() as usize;
         let mut key = vec![0; len];
         buf.read_exact(key.as_mut_slice()).unwrap();
@@ -43,12 +42,12 @@ mod tests {
         for _i in 0..10 {
             let key: Vec<u8> = (0..100).map(|_| rng.gen_range(0..255)).collect();
             let val: Vec<u8> = (0..100).map(|_| rng.gen_range(0..255)).collect();
-            let e = Encoder::encode_event(&key, &val);
+            let e = EventEncoder::encode_event(&key, &val);
             let mut event = vec![];
             for s in e {
                 event.extend_from_slice(s.as_ref());
             }
-            let (decoded_key, decoded_val) = Encoder::decode_event(&event);
+            let (decoded_key, decoded_val) = EventEncoder::decode_event(&event);
             assert_eq!(key, decoded_key);
             assert_eq!(val, decoded_val);
         }

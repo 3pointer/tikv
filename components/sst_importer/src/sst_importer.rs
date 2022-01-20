@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::fs::File;
+use std::io::{prelude::*, BufReader};
 
 use futures::executor::ThreadPool;
 use kvproto::brpb::{CipherInfo, StorageBackend};
@@ -19,7 +21,10 @@ use engine_traits::{
 };
 use file_system::{get_io_rate_limiter, OpenOptions};
 use kvproto::kvrpcpb::ApiVersion;
-use tikv_util::time::{Instant, Limiter};
+use tikv_util::{
+    codec::stream_event::EventEncoder,
+    time::{Instant, Limiter},
+};
 use txn_types::{Key, TimeStamp, WriteRef};
 
 use crate::import_file::{ImportDir, ImportFile};
@@ -134,15 +139,20 @@ impl SSTImporter {
         name: &str,
         rewrite_rule: &RewriteRule,
         speed_limiter: Limiter,
-        encoder: Encoder,
         engine: E,
     ) -> Result<Option<Range>> {
-        debug!("download start";
+        debug!("apply start";
             "url" => ?backend,
             "name" => name,
             "rewrite_rule" => ?rewrite_rule,
         );
-        match self.do_download_and_apply::<E>(backend, name, rewrite_rule, &speed_limiter, engine) {
+        match self.do_download_and_apply::<E>(
+            backend,
+            name,
+            rewrite_rule,
+            &speed_limiter,
+            engine,
+        ) {
             Ok(r) => {
                 info!("apply"; "name" => name, "range" => ?r);
                 Ok(r)
@@ -225,7 +235,6 @@ impl SSTImporter {
         src_file_name: &str,
         dst_file: std::path::PathBuf,
         backend: &StorageBackend,
-        rewrite_rule: &RewriteRule,
         file_crypter: Option<FileEncryptionInfo>,
         speed_limiter: &Limiter,
     ) -> Result<()> {
@@ -280,26 +289,32 @@ impl SSTImporter {
         &self,
         backend: &StorageBackend,
         name: &str,
-        rewrite_rule: &RewriteRule,
+        _rewrite_rule: &RewriteRule,
         speed_limiter: &Limiter,
-        engine: E,
+        _engine: E,
     ) -> Result<Option<Range>> {
         let path = self.dir.get_import_path(name)?;
-
         self.download_file_from_external_storage(
             // don't check file lengthn after download file for now.
             0,
             name,
-            path.temp,
+            path.temp.clone(),
             backend,
-            rewrite_rule,
             // don't support encrypt for now.
             None,
             &speed_limiter,
         )?;
 
         // iterator `path.temp` file and performs rewrites and apply.
-        unimplemented!();
+        let file = File::open(path.temp)?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let (k, v) = EventEncoder::decode_event(line?.as_bytes());
+            println!("key: {:?}, val: {:?}", k, v);
+            // engine.put_cf()
+        }
+        Ok(None)
     }
 
     fn do_download<E: KvEngine>(
@@ -325,7 +340,6 @@ impl SSTImporter {
             name,
             path.temp.clone(),
             backend,
-            rewrite_rule,
             file_crypter,
             &speed_limiter,
         )?;

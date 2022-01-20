@@ -44,6 +44,7 @@ use tikv_util::{
     warn,
     worker::Scheduler,
     Either,
+    codec::stream_event::EventEncoder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -785,7 +786,7 @@ impl DataFile {
     async fn on_event(&mut self, mut kv: ApplyEvent) -> Result<usize> {
         let now = Instant::now_coarse();
         let _entry_size = kv.size();
-        let encoded = Encoder::encode_event(&kv.key, &kv.value);
+        let encoded = EventEncoder::encode_event(&kv.key, &kv.value);
         let mut size = 0;
         for slice in encoded {
             let slice = slice.as_ref();

@@ -25,7 +25,6 @@ use kvproto::import_sstpb::*;
 use kvproto::raft_cmdpb::*;
 
 use crate::server::CONFIG_ROCKSDB_GAUGE;
-use br_stream::codec::Encoder;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::{Callback, RaftCmdExtraOpts, RegionSnapshot};
 use tikv_util::future::create_stream_with_buffer;
@@ -47,7 +46,6 @@ where
 {
     cfg: Config,
     engine: E,
-    encoder: Encoder,
     router: Router,
     threads: ThreadPool,
     importer: Arc<SSTImporter>,
@@ -87,7 +85,6 @@ where
         ImportSSTService {
             cfg,
             engine,
-            encoder: Encoder,
             threads,
             router,
             importer,
@@ -377,7 +374,6 @@ where
         let timer = Instant::now_coarse();
         let importer = Arc::clone(&self.importer);
         let engine = self.engine.clone();
-        let encoder = self.encoder.clone();
         let limiter = self.limiter.clone();
         let start = Instant::now();
 
@@ -398,7 +394,7 @@ where
             match res {
                 Ok(range) => match range {
                     Some(r) => resp.set_range(r),
-                    None => resp.set_error("no file applyed"),
+                    None => unimplemented!(),
                 },
                 Err(e) => resp.set_error(e.into()),
             }
