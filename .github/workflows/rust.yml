@@ -1,0 +1,22 @@
+name: Rust
+
+on:
+  push:
+    branches: [ br-stream ]
+  pull_request:
+    branches: [ br-stream ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Clippy
+      run: make clippy
+    - name: Run tests
+      run: cargo test --pacakge br-stream
