@@ -28,4 +28,4 @@ jobs:
     - name: Clippy
       run: make clippy
     - name: Run tests
-      run: cargo test --pacakge br-stream
+      run: cargo test --package br-stream
