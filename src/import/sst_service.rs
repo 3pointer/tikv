@@ -25,6 +25,7 @@ use kvproto::import_sstpb::*;
 use kvproto::raft_cmdpb::*;
 
 use crate::server::CONFIG_ROCKSDB_GAUGE;
+use br_stream::codec::Encoder;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::{Callback, RaftCmdExtraOpts, RegionSnapshot};
 use tikv_util::future::create_stream_with_buffer;
@@ -46,6 +47,7 @@ where
 {
     cfg: Config,
     engine: E,
+    encoder: Encoder,
     router: Router,
     threads: ThreadPool,
     importer: Arc<SSTImporter>,
@@ -85,6 +87,7 @@ where
         ImportSSTService {
             cfg,
             engine,
+            encoder: Encoder,
             threads,
             router,
             importer,
@@ -365,6 +368,44 @@ where
         };
 
         self.threads.spawn_ok(buf_driver);
+        self.threads.spawn_ok(handle_task);
+    }
+
+    // Downloads KV file and performs key-rewrite then apply kv into this tikv store.
+    fn apply(&mut self, _ctx: RpcContext<'_>, req: ApplyRequest, sink: UnarySink<ApplyResponse>) {
+        let label = "apply";
+        let timer = Instant::now_coarse();
+        let importer = Arc::clone(&self.importer);
+        let engine = self.engine.clone();
+        let encoder = self.encoder.clone();
+        let limiter = self.limiter.clone();
+        let start = Instant::now();
+
+        let handle_task = async move {
+            // Records how long the apply task waits to be scheduled.
+            sst_importer::metrics::IMPORTER_APPLY_DURATION
+                .with_label_values(&["queue"])
+                .observe(start.saturating_elapsed().as_secs_f64());
+
+            let res = importer.apply::<E>(
+                req.get_storage_backend(),
+                req.get_name(),
+                req.get_rewrite_rule(),
+                limiter,
+                engine,
+            );
+            let mut resp = ApplyResponse::default();
+            match res {
+                Ok(range) => match range {
+                    Some(r) => resp.set_range(r),
+                    None => resp.set_error("no file applyed"),
+                },
+                Err(e) => resp.set_error(e.into()),
+            }
+            let resp = Ok(resp);
+            crate::send_rpc_response!(resp, sink, label, timer);
+        };
+
         self.threads.spawn_ok(handle_task);
     }
 
