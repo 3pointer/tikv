@@ -4,6 +4,49 @@ use bytes::{Buf, Bytes};
 use std::io::prelude::*;
 use std::io::Cursor;
 
+pub struct EventIterator {
+    buf: Cursor<Vec<u8>>,
+    index: usize,
+    len: usize,
+    pub val: Vec<u8>,
+}
+
+impl EventIterator {
+    pub fn new(buf: Vec<u8>) -> EventIterator {
+        let len = buf.len();
+        EventIterator {
+            buf: Cursor::new(buf),
+            index: 0,
+            len,
+            val: vec![],
+        }
+    }
+}
+
+impl Iterator for EventIterator {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.len {
+            None
+        } else {
+            let len = self.buf.get_u32_le() as usize;
+            self.index += 4;
+            let mut key = vec![0; len];
+            self.buf.read_exact(key.as_mut_slice()).unwrap();
+            self.index += len;
+
+            let len = self.buf.get_u32_le() as usize;
+            self.index += 4;
+            let mut val = vec![0; len];
+            self.buf.read_exact(val.as_mut_slice()).unwrap();
+            self.index += len;
+            self.val = val;
+            Some(key)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EventEncoder;
 
@@ -19,7 +62,8 @@ impl EventEncoder {
         ]
     }
 
-    pub fn decode_event(e: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    #[allow(dead_code)]
+    fn decode_event(e: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut buf = Cursor::new(Bytes::from(e.to_vec()));
         let len = buf.get_u32_le() as usize;
         let mut key = vec![0; len];

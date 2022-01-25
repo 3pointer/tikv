@@ -387,6 +387,7 @@ where
                 req.get_storage_backend(),
                 req.get_name(),
                 req.get_rewrite_rule(),
+                req.get_cf(),
                 limiter,
                 engine,
             );
@@ -394,7 +395,7 @@ where
             match res {
                 Ok(range) => match range {
                     Some(r) => resp.set_range(r),
-                    None => unimplemented!(),
+                    None => (),
                 },
                 Err(e) => resp.set_error(e.into()),
             }

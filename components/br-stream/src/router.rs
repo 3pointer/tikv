@@ -39,12 +39,13 @@ use slog_global::debug;
 use tidb_query_datatype::codec::table::decode_table_id;
 
 use tikv_util::{
-    box_err, defer, error, info,
+    box_err,
+    codec::stream_event::EventEncoder,
+    defer, info,
     time::{Instant, Limiter},
     warn,
     worker::Scheduler,
     Either,
-    codec::stream_event::EventEncoder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;

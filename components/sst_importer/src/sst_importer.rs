@@ -2,11 +2,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{prelude::*, BufReader};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::fs::File;
-use std::io::{prelude::*, BufReader};
 
 use futures::executor::ThreadPool;
 use kvproto::brpb::{CipherInfo, StorageBackend};
@@ -22,7 +22,7 @@ use engine_traits::{
 use file_system::{get_io_rate_limiter, OpenOptions};
 use kvproto::kvrpcpb::ApiVersion;
 use tikv_util::{
-    codec::stream_event::EventEncoder,
+    codec::stream_event::EventIterator,
     time::{Instant, Limiter},
 };
 use txn_types::{Key, TimeStamp, WriteRef};
@@ -138,18 +138,21 @@ impl SSTImporter {
         backend: &StorageBackend,
         name: &str,
         rewrite_rule: &RewriteRule,
+        cf: &str,
         speed_limiter: Limiter,
         engine: E,
     ) -> Result<Option<Range>> {
         debug!("apply start";
             "url" => ?backend,
             "name" => name,
+            "cf" => cf,
             "rewrite_rule" => ?rewrite_rule,
         );
         match self.do_download_and_apply::<E>(
             backend,
             name,
             rewrite_rule,
+            cf,
             &speed_limiter,
             engine,
         ) {
@@ -158,7 +161,7 @@ impl SSTImporter {
                 Ok(r)
             }
             Err(e) => {
-                error!(%e; "applyfailed"; "name" => name,);
+                error!(%e; "apply failed"; "name" => name,);
                 Err(e)
             }
         }
@@ -289,9 +292,10 @@ impl SSTImporter {
         &self,
         backend: &StorageBackend,
         name: &str,
-        _rewrite_rule: &RewriteRule,
+        rewrite_rule: &RewriteRule,
+        cf: &str,
         speed_limiter: &Limiter,
-        _engine: E,
+        engine: E,
     ) -> Result<Option<Range>> {
         let path = self.dir.get_import_path(name)?;
         self.download_file_from_external_storage(
@@ -304,17 +308,78 @@ impl SSTImporter {
             None,
             &speed_limiter,
         )?;
+        info!("download file finished {}", name);
 
         // iterator `path.temp` file and performs rewrites and apply.
         let file = File::open(path.temp)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer)?;
 
-        for line in reader.lines() {
-            let (k, v) = EventEncoder::decode_event(line?.as_bytes());
-            println!("key: {:?}, val: {:?}", k, v);
-            // engine.put_cf()
+        let mut event_iter = EventIterator::new(buffer);
+
+        let old_prefix = rewrite_rule.get_old_key_prefix();
+        let new_prefix = rewrite_rule.get_new_key_prefix();
+
+        let perform_rewrite = old_prefix != new_prefix;
+
+        // perform iteration and key rewrite.
+        let mut key = keys::data_key(new_prefix);
+        let new_prefix_data_key_len = key.len();
+        let mut smallest_key = None;
+        let mut largest_key = None;
+
+        loop {
+            match event_iter.next() {
+                Some(k) => {
+                    if perform_rewrite {
+                        let old_key = &k;
+
+                        if !old_key.starts_with(old_prefix) {
+                            return Err(Error::WrongKeyPrefix {
+                                what: "Key in file",
+                                key: old_key.to_vec(),
+                                prefix: old_prefix.to_vec(),
+                            });
+                        }
+                        key.truncate(new_prefix_data_key_len);
+                        key.extend_from_slice(&old_key[old_prefix.len()..]);
+
+                        debug!(
+                            "perform rewrite new key: {:?}, new key prefix: {:?}, old key prefix: {:?}",
+                            log_wrappers::Value::key(keys::origin_key(&key)),
+                            log_wrappers::Value::key(&new_prefix),
+                            log_wrappers::Value::key(&old_prefix),
+                        );
+                    } else {
+                        key = keys::data_key(&k);
+                    }
+                    let value = Cow::Borrowed(&event_iter.val);
+                    // TODO handle delete cf
+                    engine.put_cf(cf, &key, &value)?;
+
+                    smallest_key = smallest_key.map_or(Some(k.clone()), |sk| {
+                        if sk > k { Some(k.clone()) } else { Some(sk) }
+                    });
+                    largest_key = largest_key.map_or(Some(k.clone()), |lk| {
+                        if lk < k { Some(k.clone()) } else { Some(lk) }
+                    });
+                }
+                None => break,
+            }
         }
-        Ok(None)
+        engine.flush_cf(cf, true)?;
+        info!("apply file finished {}", name);
+
+        match (smallest_key, largest_key) {
+            (Some(sk), Some(lk)) => {
+                let mut final_range = Range::default();
+                final_range.set_start(sk);
+                final_range.set_end(lk);
+                Ok(Some(final_range))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn do_download<E: KvEngine>(
