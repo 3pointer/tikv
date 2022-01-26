@@ -96,4 +96,34 @@ mod tests {
             assert_eq!(val, decoded_val);
         }
     }
+
+    #[test]
+    fn test_decode_events() {
+        let mut rng = rand::thread_rng();
+        let mut event = vec![];
+        let mut keys = vec![];
+        let mut vals = vec![];
+        let count = 20;
+
+        for _i in 0..count {
+            let key: Vec<u8> = (0..100).map(|_| rng.gen_range(0..255)).collect();
+            let val: Vec<u8> = (0..100).map(|_| rng.gen_range(0..255)).collect();
+            let e = EventEncoder::encode_event(&key, &val);
+            for s in e {
+                event.extend_from_slice(s.as_ref());
+            }
+            keys.push(key);
+            vals.push(val);
+        }
+
+        let mut iter = EventIterator::new(event);
+
+        let mut index = 0_usize;
+        while let Some(k) = iter.next() {
+            assert_eq!(k, keys[index]);
+            assert_eq!(iter.val, vals[index]);
+            index += 1;
+        }
+        assert_eq!(count, index);
+    }
 }
