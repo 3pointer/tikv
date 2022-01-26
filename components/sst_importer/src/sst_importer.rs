@@ -261,7 +261,7 @@ impl SSTImporter {
             src_file_name,
             dst_file.clone(),
             file_length,
-            &speed_limiter,
+            speed_limiter,
             file_crypter,
         );
         IMPORTER_DOWNLOAD_BYTES.observe(file_length as _);
@@ -306,7 +306,7 @@ impl SSTImporter {
             backend,
             // don't support encrypt for now.
             None,
-            &speed_limiter,
+            speed_limiter,
         )?;
         info!("download file finished {}", name);
 
@@ -329,44 +329,39 @@ impl SSTImporter {
         let mut smallest_key = None;
         let mut largest_key = None;
 
-        loop {
-            match event_iter.next() {
-                Some(k) => {
-                    if perform_rewrite {
-                        let old_key = &k;
+        while let Some(k) = event_iter.next() {
+            if perform_rewrite {
+                let old_key = &k;
 
-                        if !old_key.starts_with(old_prefix) {
-                            return Err(Error::WrongKeyPrefix {
-                                what: "Key in file",
-                                key: old_key.to_vec(),
-                                prefix: old_prefix.to_vec(),
-                            });
-                        }
-                        key.truncate(new_prefix_data_key_len);
-                        key.extend_from_slice(&old_key[old_prefix.len()..]);
-
-                        debug!(
-                            "perform rewrite new key: {:?}, new key prefix: {:?}, old key prefix: {:?}",
-                            log_wrappers::Value::key(keys::origin_key(&key)),
-                            log_wrappers::Value::key(&new_prefix),
-                            log_wrappers::Value::key(&old_prefix),
-                        );
-                    } else {
-                        key = keys::data_key(&k);
-                    }
-                    let value = Cow::Borrowed(&event_iter.val);
-                    // TODO handle delete cf
-                    engine.put_cf(cf, &key, &value)?;
-
-                    smallest_key = smallest_key.map_or(Some(k.clone()), |sk| {
-                        if sk > k { Some(k.clone()) } else { Some(sk) }
-                    });
-                    largest_key = largest_key.map_or(Some(k.clone()), |lk| {
-                        if lk < k { Some(k.clone()) } else { Some(lk) }
+                if !old_key.starts_with(old_prefix) {
+                    return Err(Error::WrongKeyPrefix {
+                        what: "Key in file",
+                        key: old_key.to_vec(),
+                        prefix: old_prefix.to_vec(),
                     });
                 }
-                None => break,
+                key.truncate(new_prefix_data_key_len);
+                key.extend_from_slice(&old_key[old_prefix.len()..]);
+
+                debug!(
+                    "perform rewrite new key: {:?}, new key prefix: {:?}, old key prefix: {:?}",
+                    log_wrappers::Value::key(keys::origin_key(&key)),
+                    log_wrappers::Value::key(new_prefix),
+                    log_wrappers::Value::key(old_prefix),
+                );
+            } else {
+                key = keys::data_key(&k);
             }
+            let value = Cow::Borrowed(&event_iter.val);
+            // TODO handle delete cf
+            engine.put_cf(cf, &key, &value)?;
+
+            smallest_key = smallest_key.map_or(Some(k.clone()), |sk| {
+                if sk > k { Some(k.clone()) } else { Some(sk) }
+            });
+            largest_key = largest_key.map_or(Some(k.clone()), |lk| {
+                if lk < k { Some(k.clone()) } else { Some(lk) }
+            });
         }
         engine.flush_cf(cf, true)?;
         info!("apply file finished {}", name);
@@ -406,7 +401,7 @@ impl SSTImporter {
             path.temp.clone(),
             backend,
             file_crypter,
-            &speed_limiter,
+            speed_limiter,
         )?;
 
         // now validate the SST file.

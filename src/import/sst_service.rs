@@ -393,10 +393,11 @@ where
             );
             let mut resp = ApplyResponse::default();
             match res {
-                Ok(range) => match range {
-                    Some(r) => resp.set_range(r),
-                    None => (),
-                },
+                Ok(range) => {
+                    if let Some(r) = range {
+                        resp.set_range(r);
+                    }
+                }
                 Err(e) => resp.set_error(e.into()),
             }
             let resp = Ok(resp);

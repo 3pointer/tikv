@@ -12,7 +12,6 @@ use std::{
 };
 
 use crate::{
-    codec::Encoder,
     endpoint::Task,
     errors::Error,
     metadata::StreamTask,
