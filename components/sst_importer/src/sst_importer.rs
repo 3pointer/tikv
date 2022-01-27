@@ -298,6 +298,7 @@ impl SSTImporter {
         engine: E,
     ) -> Result<Option<Range>> {
         let path = self.dir.get_import_path(name)?;
+        let start = Instant::now();
         self.download_file_from_external_storage(
             // don't check file length after download file for now.
             0,
@@ -309,6 +310,10 @@ impl SSTImporter {
             speed_limiter,
         )?;
         info!("download file finished {}", name);
+
+        IMPORTER_APPLY_DURATION
+            .with_label_values(&["download"])
+            .observe(start.saturating_elapsed().as_secs_f64());
 
         // iterator `path.temp` file and performs rewrites and apply.
         let file = File::open(path.temp)?;
@@ -329,6 +334,7 @@ impl SSTImporter {
         let mut smallest_key = None;
         let mut largest_key = None;
 
+        let start = Instant::now();
         loop {
             if event_iter.valid() {
                 break;
@@ -369,7 +375,11 @@ impl SSTImporter {
             engine.put_cf(cf, &key, &value)?;
         }
         engine.flush_cf(cf, true)?;
+        let label = if perform_rewrite { "rewrite" } else { "normal" };
         info!("apply file finished {}", name);
+        IMPORTER_APPLY_DURATION
+            .with_label_values(&[label])
+            .observe(start.saturating_elapsed().as_secs_f64());
 
         match (smallest_key, largest_key) {
             (Some(sk), Some(lk)) => {
