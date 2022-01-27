@@ -22,7 +22,7 @@ use engine_traits::{
 use file_system::{get_io_rate_limiter, OpenOptions};
 use kvproto::kvrpcpb::ApiVersion;
 use tikv_util::{
-    codec::stream_event::EventIterator,
+    codec::stream_event::{EventIterator, Iterator as EIterator},
     time::{Instant, Limiter},
 };
 use txn_types::{Key, TimeStamp, WriteRef};
@@ -132,7 +132,7 @@ impl SSTImporter {
         self.dir.exist(meta).unwrap_or(false)
     }
 
-    // Donwloads and Apply an KV file from an external storage.
+    // Donwloads and apply a KV file from an external storage.
     pub fn apply<E: KvEngine>(
         &self,
         backend: &StorageBackend,
@@ -299,7 +299,7 @@ impl SSTImporter {
     ) -> Result<Option<Range>> {
         let path = self.dir.get_import_path(name)?;
         self.download_file_from_external_storage(
-            // don't check file lengthn after download file for now.
+            // don't check file length after download file for now.
             0,
             name,
             path.temp.clone(),
@@ -329,9 +329,21 @@ impl SSTImporter {
         let mut smallest_key = None;
         let mut largest_key = None;
 
-        while let Some(k) = event_iter.next() {
+        loop {
+            if event_iter.valid() {
+                break;
+            }
+            event_iter.next()?;
+            let iter_key = event_iter.key().to_vec();
+            smallest_key = smallest_key.map_or(Some(iter_key.clone()), |v: Vec<u8>| {
+                Some(v.min(iter_key.clone()))
+            });
+            largest_key = largest_key.map_or(Some(iter_key.clone()), |v: Vec<u8>| {
+                Some(v.max(iter_key.clone()))
+            });
+
             if perform_rewrite {
-                let old_key = &k;
+                let old_key = event_iter.key();
 
                 if !old_key.starts_with(old_prefix) {
                     return Err(Error::WrongKeyPrefix {
@@ -350,18 +362,11 @@ impl SSTImporter {
                     log_wrappers::Value::key(old_prefix),
                 );
             } else {
-                key = keys::data_key(&k);
+                key = keys::data_key(event_iter.key());
             }
-            let value = Cow::Borrowed(&event_iter.val);
+            let value = Cow::Borrowed(event_iter.value());
             // TODO handle delete cf
             engine.put_cf(cf, &key, &value)?;
-
-            smallest_key = smallest_key.map_or(Some(k.clone()), |sk| {
-                if sk > k { Some(k.clone()) } else { Some(sk) }
-            });
-            largest_key = largest_key.map_or(Some(k.clone()), |lk| {
-                if lk < k { Some(k.clone()) } else { Some(lk) }
-            });
         }
         engine.flush_cf(cf, true)?;
         info!("apply file finished {}", name);

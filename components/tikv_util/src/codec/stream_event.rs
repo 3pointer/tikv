@@ -1,14 +1,25 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
-use crate::Either;
+use crate::{codec::Result, Either};
 use bytes::{Buf, Bytes};
 use std::io::prelude::*;
 use std::io::Cursor;
+
+pub trait Iterator {
+    fn next(&mut self) -> Result<()>;
+
+    fn valid(&self) -> bool;
+
+    fn key(&self) -> &[u8];
+
+    fn value(&self) -> &[u8];
+}
 
 pub struct EventIterator {
     buf: Cursor<Vec<u8>>,
     index: usize,
     len: usize,
-    pub val: Vec<u8>,
+    key: Vec<u8>,
+    val: Vec<u8>,
 }
 
 impl EventIterator {
@@ -18,32 +29,42 @@ impl EventIterator {
             buf: Cursor::new(buf),
             index: 0,
             len,
+            key: vec![],
             val: vec![],
         }
     }
 }
 
 impl Iterator for EventIterator {
-    type Item = Vec<u8>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.len {
-            None
-        } else {
+    fn next(&mut self) -> Result<()> {
+        if self.valid() {
             let len = self.buf.get_u32_le() as usize;
             self.index += 4;
             let mut key = vec![0; len];
-            self.buf.read_exact(key.as_mut_slice()).unwrap();
+            self.buf.read_exact(key.as_mut_slice())?;
             self.index += len;
+            self.key = key;
 
             let len = self.buf.get_u32_le() as usize;
             self.index += 4;
             let mut val = vec![0; len];
-            self.buf.read_exact(val.as_mut_slice()).unwrap();
+            self.buf.read_exact(val.as_mut_slice())?;
             self.index += len;
             self.val = val;
-            Some(key)
         }
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        self.index < self.len
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    fn value(&self) -> &[u8] {
+        &self.val
     }
 }
 
@@ -119,9 +140,13 @@ mod tests {
         let mut iter = EventIterator::new(event);
 
         let mut index = 0_usize;
-        while let Some(k) = iter.next() {
-            assert_eq!(k, keys[index]);
-            assert_eq!(iter.val, vals[index]);
+        loop {
+            if !iter.valid() {
+                break;
+            }
+            iter.next().unwrap();
+            assert_eq!(iter.key(), keys[index]);
+            assert_eq!(iter.value(), vals[index]);
             index += 1;
         }
         assert_eq!(count, index);
