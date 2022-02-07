@@ -40,7 +40,7 @@ use tidb_query_datatype::codec::table::decode_table_id;
 use tikv_util::{
     box_err,
     codec::stream_event::EventEncoder,
-    defer, info,
+    defer, info, error,
     time::{Instant, Limiter},
     warn,
     worker::Scheduler,
