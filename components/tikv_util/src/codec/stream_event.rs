@@ -40,17 +40,15 @@ impl Iterator for EventIterator {
         if self.valid() {
             let len = self.buf.get_u32_le() as usize;
             self.index += 4;
-            let mut key = vec![0; len];
-            self.buf.read_exact(key.as_mut_slice())?;
+            self.key.resize(len, 0);
+            self.buf.read_exact(self.key.as_mut_slice())?;
             self.index += len;
-            self.key = key;
 
             let len = self.buf.get_u32_le() as usize;
             self.index += 4;
-            let mut val = vec![0; len];
-            self.buf.read_exact(val.as_mut_slice())?;
+            self.val.resize(len, 0);
+            self.buf.read_exact(self.val.as_mut_slice())?;
             self.index += len;
-            self.val = val;
         }
         Ok(())
     }
