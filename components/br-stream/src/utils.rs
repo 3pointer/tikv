@@ -249,15 +249,20 @@ pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, String),
 
 #[cfg(test)]
 mod test {
-    use super::SegmentSet;
+    use crate::utils::SegmentMap;
 
     #[test]
     fn test_segment_tree() {
-        let mut tree = SegmentSet::default();
+        let mut tree = SegmentMap::default();
         assert!(tree.add((1, 4)));
         assert!(tree.add((4, 8)));
         assert!(tree.add((42, 46)));
         assert!(!tree.add((3, 8)));
+        assert!(tree.insert((47, 88), "hello".to_owned()));
+        assert_eq!(
+            tree.get_value_by_point(&49).map(String::as_str),
+            Some("hello")
+        );
         assert_eq!(tree.get_interval_by_point(&3), Some((&1, &4)));
         assert_eq!(tree.get_interval_by_point(&7), Some((&4, &8)));
         assert_eq!(tree.get_interval_by_point(&90), None);
