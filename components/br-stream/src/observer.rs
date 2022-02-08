@@ -2,7 +2,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::errors::Error;
-use crate::utils::SegmentTree;
+use crate::utils::SegmentSet;
 use dashmap::DashMap;
 use engine_traits::KvEngine;
 use kvproto::metapb::Region;
@@ -23,7 +23,7 @@ pub struct BackupStreamObserver {
     scheduler: Scheduler<Task>,
     // Note: maybe wrap those fields to methods?
     pub subs: SubscriptionTracer,
-    pub ranges: Arc<RwLock<SegmentTree<Vec<u8>>>>,
+    pub ranges: Arc<RwLock<SegmentSet<Vec<u8>>>>,
 }
 
 impl BackupStreamObserver {
