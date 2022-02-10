@@ -223,8 +223,7 @@ impl<K: Ord, V> SegmentMap<K, V> {
         self.get_interval_by_point(range.0).is_some()
             || self
                 .get_interval_by_point(range.1)
-                .map(|rng| <K as Borrow<R>>::borrow(rng.0) != range.1)
-                .unwrap_or(false)
+                .map_or(false, |rng| <K as Borrow<R>>::borrow(rng.0) != range.1)
     }
 }
 
