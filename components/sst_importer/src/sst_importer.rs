@@ -336,7 +336,7 @@ impl SSTImporter {
 
         let start = Instant::now();
         loop {
-            if event_iter.valid() {
+            if !event_iter.valid() {
                 break;
             }
             event_iter.next()?;
