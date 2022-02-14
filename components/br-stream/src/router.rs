@@ -198,7 +198,7 @@ impl ApplyEvents {
         self.events.len()
     }
 
-    fn partition_by<T: std::hash::Hash + Clone + Eq, R: Borrow<T>>(
+    fn group_by<T: std::hash::Hash + Clone + Eq, R: Borrow<T>>(
         self,
         mut partition_fn: impl FnMut(&ApplyEvent) -> Option<R>,
     ) -> HashMap<T, Self> {
@@ -213,7 +213,7 @@ impl ApplyEvents {
                         <R as Borrow<T>>::borrow(&item).clone(),
                         ApplyEvents {
                             events: {
-                                // assuming the keys in the same region would probably
+                                // assuming the keys in the same region would probably be in one group.
                                 let mut v = Vec::with_capacity(event_len);
                                 v.push(event);
                                 v
@@ -229,12 +229,12 @@ impl ApplyEvents {
     }
 
     fn partition_by_range(self, ranges: &SegmentMap<Vec<u8>, String>) -> HashMap<String, Self> {
-        self.partition_by(|event| ranges.get_value_by_point(&event.key))
+        self.group_by(|event| ranges.get_value_by_point(&event.key))
     }
 
     fn partition_by_table_key(self) -> HashMap<TempFileKey, Self> {
         let region_id = self.region_id;
-        self.partition_by(move |event| Some(TempFileKey::of(event, region_id)))
+        self.group_by(move |event| Some(TempFileKey::of(event, region_id)))
     }
 }
 
