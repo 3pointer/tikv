@@ -598,7 +598,7 @@ impl StreamTaskInfo {
         // Let's flush all files first...
         futures::future::join_all(
             w.iter()
-                .map(|(_, f)| async move { f.lock().await.inner.sync_all().await }),
+                .map(|(_, f)| async move { f.lock().await.inner.flush().await }),
         )
         .await
         .into_iter()
