@@ -48,7 +48,7 @@ use tikv_util::{
     worker::Scheduler,
     Either,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tokio::{fs::remove_file, fs::File};
 use txn_types::{Key, Lock, TimeStamp};
@@ -743,7 +743,7 @@ struct DataFile {
     max_ts: TimeStamp,
     resolved_ts: TimeStamp,
     sha256: Hasher,
-    inner: File,
+    inner: BufWriter<File>,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
     number_of_entries: usize,
@@ -809,7 +809,7 @@ impl DataFile {
             min_ts: TimeStamp::max(),
             max_ts: TimeStamp::zero(),
             resolved_ts: TimeStamp::zero(),
-            inner: File::create(local_path.as_ref()).await?,
+            inner: BufWriter::with_capacity(128 * 1024, File::create(local_path.as_ref()).await?),
             sha256,
             number_of_entries: 0,
             file_size: 0,
