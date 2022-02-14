@@ -1,5 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use std::{
+    borrow::Borrow,
     collections::HashMap,
     io,
     path::{Path, PathBuf},
@@ -46,7 +47,7 @@ use tikv_util::{
     time::{Instant, Limiter},
     warn,
     worker::Scheduler,
-    Either,
+    Either, HandyRwLock,
 };
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
@@ -60,17 +61,22 @@ pub struct ApplyEvent {
     key: Vec<u8>,
     value: Vec<u8>,
     cf: String,
-    region_id: u64,
-    region_resolved_ts: u64,
     cmd_type: CmdType,
 }
 
-impl ApplyEvent {
+#[derive(Debug)]
+pub struct ApplyEvents {
+    events: Vec<ApplyEvent>,
+    region_id: u64,
+    region_resolved_ts: u64,
+}
+
+impl ApplyEvents {
     /// Convert a [CmdBatch] to a vector of events. Ignoring admin / error commands.
-    /// Assuming the resolved ts of the region is `resolved_ts`.
+    /// At the same time, advancing status of the `Resolver` by those keys.
     /// Note: the resolved ts cannot be advanced if there is no command,
     ///       maybe we also need to update resolved_ts when flushing?
-    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut Resolver) -> Vec<Self> {
+    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut Resolver) -> Self {
         let region_id = cmd.region_id;
         let mut result = vec![];
         for req in cmd
@@ -128,35 +134,39 @@ impl ApplyEvent {
             //   (Will something like one PC break this?)
             // note: maybe get this ts from PD? The current implement cannot advance the resolved ts
             //       if there is no write.
-            let region_resolved_ts = resolver
-                .resolve(Key::decode_ts_from(&key).unwrap_or_default())
-                .into_inner();
-            let item = Self {
+            resolver.resolve(Key::decode_ts_from(&key).unwrap_or_default());
+            let item = ApplyEvent {
                 key,
                 value,
                 cf,
-                region_id,
-                region_resolved_ts,
                 cmd_type,
             };
-            if item.should_record() {
-                result.push(item);
+            if !item.should_record() {
+                SKIP_KV_COUNTER.inc();
+                continue;
             }
+            result.push(item);
         }
-        result
+        Self {
+            events: result,
+            region_id,
+            region_resolved_ts: resolver.resolved_ts().into_inner(),
+        }
     }
 
     /// make an apply event from a prewrite record kv pair.
     pub fn from_prewrite(key: Vec<u8>, value: Vec<u8>, region: u64) -> Self {
         Self {
-            key,
-            value,
-            // Uncommitted (prewrite) records can only exist at default CF.
-            cf: CF_DEFAULT.to_owned(),
+            events: vec![ApplyEvent {
+                key,
+                value,
+                // Uncommitted (prewrite) records can only exist at default CF.
+                cf: CF_DEFAULT.to_owned(),
+                cmd_type: CmdType::Put,
+            }],
             region_id: region,
             // The prewrite hasn't been committed -- we cannot get more information about it.
             region_resolved_ts: 0,
-            cmd_type: CmdType::Put,
         }
     }
 
@@ -166,15 +176,69 @@ impl ApplyEvent {
         // Once we can scan the write key, the txn must be committed.
         let resolved_ts = utils::get_ts(&key)?;
         Ok(Self {
-            key: key.into_encoded(),
-            value,
-            cf: cf.to_owned(),
+            events: vec![ApplyEvent {
+                key: key.into_encoded(),
+                value,
+                cf: cf.to_owned(),
+                cmd_type: CmdType::Put,
+            }],
             region_id: region,
+            // Note:
+            // This only implies there are no locking for this key, but not for other keys.
+            // Maybe we'd better set it to 0?
             region_resolved_ts: resolved_ts.into_inner(),
-            cmd_type: CmdType::Put,
         })
     }
 
+    pub fn size(&self) -> usize {
+        self.events.iter().map(ApplyEvent::size).sum()
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn partition_by<T: std::hash::Hash + Clone + Eq, R: Borrow<T>>(
+        self,
+        mut partition_fn: impl FnMut(&ApplyEvent) -> Option<R>,
+    ) -> HashMap<T, Self> {
+        let mut result: HashMap<T, Self> = HashMap::new();
+        let event_len = self.len();
+        for event in self.events {
+            if let Some(item) = partition_fn(&event) {
+                if let Some(events) = result.get_mut(<R as Borrow<T>>::borrow(&item)) {
+                    events.events.push(event);
+                } else {
+                    result.insert(
+                        <R as Borrow<T>>::borrow(&item).clone(),
+                        ApplyEvents {
+                            events: {
+                                // assuming the keys in the same region would probably
+                                let mut v = Vec::with_capacity(event_len);
+                                v.push(event);
+                                v
+                            },
+                            region_resolved_ts: self.region_resolved_ts,
+                            region_id: self.region_id,
+                        },
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    fn partition_by_range(self, ranges: &SegmentMap<Vec<u8>, String>) -> HashMap<String, Self> {
+        self.partition_by(|event| ranges.get_value_by_point(&event.key))
+    }
+
+    fn partition_by_table_key(self) -> HashMap<TempFileKey, Self> {
+        let region_id = self.region_id;
+        self.partition_by(move |event| Some(TempFileKey::of(event, region_id)))
+    }
+}
+
+impl ApplyEvent {
     /// Check whether the key associate to the event is a meta key.
     pub fn is_meta(&self) -> bool {
         // Can we make things not looking so hacky?
@@ -328,17 +392,11 @@ impl RouterInner {
         Ok(task_info)
     }
 
-    pub async fn on_event(&self, kv: ApplyEvent) -> Result<()> {
-        if let Some(task) = self.get_task_by_key(&kv.key) {
-            debug!(
-                "backup stream kv";
-                "cmdtype" => ?kv.cmd_type,
-                "cf" => ?kv.cf,
-                "key" => &log_wrappers::Value::key(&kv.key),
-            );
-
+    pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
+        let partitioned_events = kv.partition_by_range(&self.ranges.rl());
+        for (task, events) in partitioned_events {
             let task_info = self.get_task_info(&task).await?;
-            task_info.on_event(kv).await?;
+            task_info.on_events(events).await?;
 
             // When this event make the size of temporary files exceeds the size limit, make a flush.
             // Note that we only flush if the size is less than the limit before the event,
@@ -416,13 +474,13 @@ struct TempFileKey {
 
 impl TempFileKey {
     /// Create the key for an event. The key can be used to find which temporary file the event should be stored.
-    fn of(kv: &ApplyEvent) -> Self {
+    fn of(kv: &ApplyEvent, region_id: u64) -> Self {
         let table_id = if kv.is_meta() {
             // Force table id of meta key be zero.
             0
         } else {
             // When we cannot extract the table key, use 0 for the table key(perhaps we insert meta key here.).
-            // Can we emit the copy here(or at least, take a slice of key instead of decoding the whole key)?
+            // Can we elide the copy here(or at least, take a slice of key instead of decoding the whole key)?
             Key::from_encoded_slice(&kv.key)
                 .into_raw()
                 .ok()
@@ -432,7 +490,7 @@ impl TempFileKey {
         Self {
             is_meta: kv.is_meta(),
             table_id,
-            region_id: kv.region_id,
+            region_id,
             cf: kv.cf.clone(),
             cmd_type: kv.cmd_type,
         }
@@ -556,31 +614,30 @@ impl StreamTaskInfo {
 
     /// Append a event to the files. This wouldn't trigger `fsync` syscall.
     /// i.e. No guarantee of persistence.
-    pub async fn on_event(&self, kv: ApplyEvent) -> Result<()> {
+    pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
         let now = Instant::now_coarse();
         defer! { crate::metrics::ON_EVENT_COST_HISTOGRAM.with_label_values(&["write_to_tempfile"]).observe(now.saturating_elapsed_secs()) }
-        let key = TempFileKey::of(&kv);
+        for (key, events) in kv.partition_by_table_key() {
+            if let Some(f) = self.files.read().await.get(&key) {
+                self.total_size
+                    .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
+                return Ok(());
+            }
 
-        if let Some(f) = self.files.read().await.get(&key) {
+            // slow path: try to insert the element.
+            let mut w = self.files.write().await;
+            // double check before insert. there may be someone already insert that
+            // when we are waiting for the write lock.
+            if !w.contains_key(&key) {
+                let path = self.temp_dir.join(key.temp_file_name());
+                let val = Mutex::new(DataFile::new(path).await?);
+                w.insert(key.clone(), val);
+            }
+
+            let f = w.get(&key).unwrap();
             self.total_size
-                .fetch_add(f.lock().await.on_event(kv).await?, Ordering::SeqCst);
-            return Ok(());
+                .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
         }
-
-        // slow path: try to insert the element.
-        let mut w = self.files.write().await;
-        // double check before insert. there may be someone already insert that
-        // when we are waiting for the write lock.
-        if !w.contains_key(&key) {
-            let path = self.temp_dir.join(key.temp_file_name());
-            let val = Mutex::new(DataFile::new(path).await?);
-            w.insert(key.clone(), val);
-        }
-
-        let f = w.get(&key).unwrap();
-        self.total_size
-            .fetch_add(f.lock().await.on_event(kv).await?, Ordering::SeqCst);
-
         Ok(())
     }
 
@@ -825,31 +882,34 @@ impl DataFile {
     }
 
     /// Add a new KV pair to the file, returning its size.
-    async fn on_event(&mut self, mut kv: ApplyEvent) -> Result<usize> {
+    async fn on_events(&mut self, events: ApplyEvents) -> Result<usize> {
         let now = Instant::now_coarse();
-        let _entry_size = kv.size();
-        let encoded = EventEncoder::encode_event(&kv.key, &kv.value);
-        let mut size = 0;
-        for slice in encoded {
-            let slice = slice.as_ref();
-            self.inner.write_all(slice).await?;
-            self.sha256.update(slice).map_err(|err| {
-                Error::Other(box_err!("openssl hasher failed to update: {}", err))
-            })?;
-            size += slice.len();
+        let mut total_size = 0;
+        for mut event in events.events {
+            let encoded = EventEncoder::encode_event(&event.key, &event.value);
+            let mut size = 0;
+            for slice in encoded {
+                let slice = slice.as_ref();
+                self.inner.write_all(slice).await?;
+                self.sha256.update(slice).map_err(|err| {
+                    Error::Other(box_err!("openssl hasher failed to update: {}", err))
+                })?;
+                size += slice.len();
+            }
+            let key = Key::from_encoded(std::mem::take(&mut event.key));
+            let ts = key.decode_ts().expect("key without ts");
+            total_size += size;
+            self.min_ts = self.min_ts.min(ts);
+            self.max_ts = self.max_ts.max(ts);
+            self.resolved_ts = self.resolved_ts.max(events.region_resolved_ts.into());
+            self.number_of_entries += 1;
+            self.file_size += size;
+            self.update_key_bound(key.into_encoded());
         }
-        let key = Key::from_encoded(std::mem::take(&mut kv.key));
-        let ts = key.decode_ts().expect("key without ts");
-        self.min_ts = self.min_ts.min(ts);
-        self.max_ts = self.max_ts.max(ts);
-        self.resolved_ts = self.resolved_ts.max(kv.region_resolved_ts.into());
-        self.number_of_entries += 1;
-        self.file_size += size;
-        self.update_key_bound(key.into_encoded());
         crate::metrics::ON_EVENT_COST_HISTOGRAM
             .with_label_values(&["syscall_write"])
             .observe(now.saturating_elapsed_secs());
-        Ok(size)
+        Ok(total_size)
     }
 
     /// Update the `start_key` and `end_key` of `self` as if a new key added.
@@ -941,7 +1001,7 @@ mod tests {
     struct KvEventsBuilder {
         region_id: u64,
         region_resolved_ts: u64,
-        events: Vec<ApplyEvent>,
+        events: Vec<ApplyEvents>,
     }
 
     fn make_table_key(table_id: i64, key: &[u8]) -> Vec<u8> {
@@ -973,25 +1033,29 @@ mod tests {
             .into_encoded()
         }
 
-        fn put_event(&self, cf: &'static str, key: Vec<u8>, value: Vec<u8>) -> ApplyEvent {
-            ApplyEvent {
-                key: self.wrap_key(key),
-                value,
-                cf: cf.to_owned(),
+        fn put_event(&self, cf: &'static str, key: Vec<u8>, value: Vec<u8>) -> ApplyEvents {
+            ApplyEvents {
+                events: vec![ApplyEvent {
+                    key: self.wrap_key(key),
+                    value,
+                    cf: cf.to_owned(),
+                    cmd_type: CmdType::Put,
+                }],
                 region_id: self.region_id,
                 region_resolved_ts: self.region_resolved_ts,
-                cmd_type: CmdType::Put,
             }
         }
 
-        fn delete_event(&self, cf: &'static str, key: Vec<u8>) -> ApplyEvent {
-            ApplyEvent {
-                key: self.wrap_key(key),
-                value: vec![],
-                cf: cf.to_owned(),
+        fn delete_event(&self, cf: &'static str, key: Vec<u8>) -> ApplyEvents {
+            ApplyEvents {
+                events: vec![ApplyEvent {
+                    key: self.wrap_key(key),
+                    value: vec![],
+                    cf: cf.to_owned(),
+                    cmd_type: CmdType::Delete,
+                }],
                 region_id: self.region_id,
                 region_resolved_ts: self.region_resolved_ts,
-                cmd_type: CmdType::Delete,
             }
         }
 
@@ -1006,7 +1070,7 @@ mod tests {
             self.events.push(self.delete_event(cf, table_key));
         }
 
-        fn flush_events(&mut self) -> Vec<ApplyEvent> {
+        fn flush_events(&mut self) -> Vec<ApplyEvents> {
             std::mem::take(&mut self.events)
         }
     }
@@ -1085,7 +1149,7 @@ mod tests {
         println!("{:?}", region1);
         let events = region1.flush_events();
         for event in events {
-            router.on_event(event).await?;
+            router.on_events(event).await?;
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let end_ts = TimeStamp::physical_now();

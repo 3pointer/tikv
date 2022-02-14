@@ -26,7 +26,7 @@ use crate::{
 };
 use crate::{
     metrics,
-    router::{ApplyEvent, Router},
+    router::{ApplyEvents, Router},
 };
 
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region};
@@ -71,7 +71,7 @@ impl<S: Snapshot> EventLoader<S> {
     fn scan_batch(
         &mut self,
         batch_size: usize,
-        result: &mut Vec<ApplyEvent>,
+        result: &mut Vec<ApplyEvents>,
     ) -> Result<Statistics> {
         let mut b = EntryBatch::with_capacity(batch_size);
         self.scanner.scan_entries(&mut b)?;
@@ -82,15 +82,15 @@ impl<S: Snapshot> EventLoader<S> {
                     ..
                 } => {
                     if !key.is_empty() {
-                        result.push(ApplyEvent::from_prewrite(key, value, self.region_id));
+                        result.push(ApplyEvents::from_prewrite(key, value, self.region_id));
                     }
                 }
                 TxnEntry::Commit { default, write, .. } => {
                     let write =
-                        ApplyEvent::from_committed(CF_WRITE, write.0, write.1, self.region_id)?;
+                        ApplyEvents::from_committed(CF_WRITE, write.0, write.1, self.region_id)?;
                     result.push(write);
                     if !default.0.is_empty() {
-                        let default = ApplyEvent::from_committed(
+                        let default = ApplyEvents::from_committed(
                             CF_DEFAULT,
                             default.0,
                             default.1,
@@ -201,7 +201,7 @@ where
             tokio::spawn(async move {
                 for event in events {
                     metrics::INCREMENTAL_SCAN_SIZE.observe(event.size() as f64);
-                    if let Err(err) = sink.on_event(event).await {
+                    if let Err(err) = sink.on_events(event).await {
                         warn!("failed to send event to sink"; "err" => %err);
                     }
                 }
