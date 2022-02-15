@@ -43,7 +43,7 @@ use tidb_query_datatype::codec::table::decode_table_id;
 use tikv_util::{
     box_err,
     codec::stream_event::EventEncoder,
-    defer, error, info,
+    error, info,
     time::{Instant, Limiter},
     warn,
     worker::Scheduler,
@@ -368,32 +368,38 @@ impl RouterInner {
         Ok(task_info)
     }
 
-    pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
-        let partitioned_events = kv.partition_by_range(&self.ranges.rl());
-        for (task, events) in partitioned_events {
-            let task_info = self.get_task_info(&task).await?;
-            task_info.on_events(events).await?;
+    async fn on_event(&self, task: String, events: ApplyEvents) -> Result<()> {
+        let task_info = self.get_task_info(&task).await?;
+        task_info.on_events(events).await?;
 
-            // When this event make the size of temporary files exceeds the size limit, make a flush.
-            // Note that we only flush if the size is less than the limit before the event,
-            // or we may send multiplied flush requests.
-            debug!(
-                "backup stream statics size";
-                "task" => ?task,
-                "next_size" => task_info.total_size(),
-                "size_limit" => self.temp_file_size_limit,
-            );
-            let cur_size = task_info.total_size();
-            if cur_size > self.temp_file_size_limit && !task_info.is_flushing() {
-                info!("try flushing task"; "task" => %task, "size" => %cur_size);
-                if task_info.set_flushing_status_cas(false, true).is_ok() {
-                    if let Err(e) = self.scheduler.schedule(Task::Flush(task)) {
-                        error!("backup stream schedule task failed"; "error" => ?e);
-                        task_info.set_flushing_status(false);
-                    }
+        // When this event make the size of temporary files exceeds the size limit, make a flush.
+        // Note that we only flush if the size is less than the limit before the event,
+        // or we may send multiplied flush requests.
+        debug!(
+            "backup stream statics size";
+            "task" => ?task,
+            "next_size" => task_info.total_size(),
+            "size_limit" => self.temp_file_size_limit,
+        );
+        let cur_size = task_info.total_size();
+        if cur_size > self.temp_file_size_limit && !task_info.is_flushing() {
+            info!("try flushing task"; "task" => %task, "size" => %cur_size);
+            if task_info.set_flushing_status_cas(false, true).is_ok() {
+                if let Err(e) = self.scheduler.schedule(Task::Flush(task)) {
+                    error!("backup stream schedule task failed"; "error" => ?e);
+                    task_info.set_flushing_status(false);
                 }
             }
         }
+        Ok(())
+    }
+
+    pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
+        let partitioned_events = kv.partition_by_range(&self.ranges.rl());
+        let tasks = partitioned_events
+            .into_iter()
+            .map(|(task, events)| self.on_event(task, events));
+        futures::future::try_join_all(tasks).await?;
         Ok(())
     }
 
@@ -588,32 +594,42 @@ impl StreamTaskInfo {
         })
     }
 
+    async fn on_events_of_key(&self, key: TempFileKey, events: ApplyEvents) -> Result<()> {
+        if let Some(f) = self.files.read().await.get(&key) {
+            self.total_size
+                .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        // slow path: try to insert the element.
+        let mut w = self.files.write().await;
+        // double check before insert. there may be someone already insert that
+        // when we are waiting for the write lock.
+        if !w.contains_key(&key) {
+            let path = self.temp_dir.join(key.temp_file_name());
+            let val = Mutex::new(DataFile::new(path).await?);
+            w.insert(key.clone(), val);
+        }
+
+        let f = w.get(&key).unwrap();
+        self.total_size
+            .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Append a event to the files. This wouldn't trigger `fsync` syscall.
     /// i.e. No guarantee of persistence.
     pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
         let now = Instant::now_coarse();
-        defer! { crate::metrics::ON_EVENT_COST_HISTOGRAM.with_label_values(&["write_to_tempfile"]).observe(now.saturating_elapsed_secs()) }
-        for (key, events) in kv.partition_by_table_key() {
-            if let Some(f) = self.files.read().await.get(&key) {
-                self.total_size
-                    .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
-                return Ok(());
-            }
-
-            // slow path: try to insert the element.
-            let mut w = self.files.write().await;
-            // double check before insert. there may be someone already insert that
-            // when we are waiting for the write lock.
-            if !w.contains_key(&key) {
-                let path = self.temp_dir.join(key.temp_file_name());
-                let val = Mutex::new(DataFile::new(path).await?);
-                w.insert(key.clone(), val);
-            }
-
-            let f = w.get(&key).unwrap();
-            self.total_size
-                .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
-        }
+        futures::future::try_join_all(
+            kv.partition_by_table_key()
+                .into_iter()
+                .map(|(key, events)| self.on_events_of_key(key, events)),
+        )
+        .await?;
+        crate::metrics::ON_EVENT_COST_HISTOGRAM
+            .with_label_values(&["write_to_tempfile"])
+            .observe(now.saturating_elapsed_secs());
         Ok(())
     }
 

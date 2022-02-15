@@ -207,7 +207,6 @@ where
             if let Err(err) = router.on_events(kvs).await {
                 err.report("failed to send event.");
             }
-            
             metrics::HEAP_MEMORY
                 .with_label_values(&["free"])
                 .inc_by(total_size as f64);
