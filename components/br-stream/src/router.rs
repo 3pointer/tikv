@@ -58,10 +58,10 @@ pub const FLUSH_STORAGE_INTERVAL: u64 = 300;
 
 #[derive(Debug)]
 pub struct ApplyEvent {
-    key: Vec<u8>,
-    value: Vec<u8>,
-    cf: String,
-    cmd_type: CmdType,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub cf: CfName,
+    pub cmd_type: CmdType,
 }
 
 #[derive(Debug)]
@@ -154,40 +154,16 @@ impl ApplyEvents {
         }
     }
 
-    /// make an apply event from a prewrite record kv pair.
-    pub fn from_prewrite(key: Vec<u8>, value: Vec<u8>, region: u64) -> Self {
-        Self {
-            events: vec![ApplyEvent {
-                key,
-                value,
-                // Uncommitted (prewrite) records can only exist at default CF.
-                cf: CF_DEFAULT.to_owned(),
-                cmd_type: CmdType::Put,
-            }],
-            region_id: region,
-            // The prewrite hasn't been committed -- we cannot get more information about it.
-            region_resolved_ts: 0,
-        }
+    pub fn push(&mut self, event: ApplyEvent) {
+        self.events.push(event);
     }
 
-    /// make an apply event from a committed KV pair.
-    pub fn from_committed(cf: CfName, key: Vec<u8>, value: Vec<u8>, region: u64) -> Result<Self> {
-        let key = Key::from_encoded(key);
-        // Once we can scan the write key, the txn must be committed.
-        let resolved_ts = utils::get_ts(&key)?;
-        Ok(Self {
-            events: vec![ApplyEvent {
-                key: key.into_encoded(),
-                value,
-                cf: cf.to_owned(),
-                cmd_type: CmdType::Put,
-            }],
-            region_id: region,
-            // Note:
-            // This only implies there are no locking for this key, but not for other keys.
-            // Maybe we'd better set it to 0?
-            region_resolved_ts: resolved_ts.into_inner(),
-        })
+    pub fn with_capacity(cap: usize, region_id: u64) -> Self {
+        Self {
+            events: Vec::with_capacity(cap),
+            region_id,
+            region_resolved_ts: 0,
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -468,7 +444,7 @@ struct TempFileKey {
     is_meta: bool,
     table_id: i64,
     region_id: u64,
-    cf: String,
+    cf: CfName,
     cmd_type: CmdType,
 }
 
@@ -491,7 +467,7 @@ impl TempFileKey {
             is_meta: kv.is_meta(),
             table_id,
             region_id,
-            cf: kv.cf.clone(),
+            cf: kv.cf,
             cmd_type: kv.cmd_type,
         }
     }
@@ -955,7 +931,7 @@ impl DataFile {
 
         meta.set_is_meta(file_key.is_meta);
         meta.set_table_id(file_key.table_id);
-        meta.set_cf(file_key.cf.clone());
+        meta.set_cf(file_key.cf.to_owned());
         meta.set_region_id(file_key.region_id as i64);
         meta.set_type(file_key.get_file_type());
 
@@ -999,9 +975,7 @@ mod tests {
 
     #[derive(Debug)]
     struct KvEventsBuilder {
-        region_id: u64,
-        region_resolved_ts: u64,
-        events: Vec<ApplyEvents>,
+        events: ApplyEvents,
     }
 
     fn make_table_key(table_id: i64, key: &[u8]) -> Vec<u8> {
@@ -1018,9 +992,11 @@ mod tests {
     impl KvEventsBuilder {
         fn new(region_id: u64, region_resolved_ts: u64) -> Self {
             Self {
-                region_id,
-                region_resolved_ts,
-                events: vec![],
+                events: ApplyEvents {
+                    events: vec![],
+                    region_id,
+                    region_resolved_ts,
+                },
             }
         }
 
@@ -1033,45 +1009,45 @@ mod tests {
             .into_encoded()
         }
 
-        fn put_event(&self, cf: &'static str, key: Vec<u8>, value: Vec<u8>) -> ApplyEvents {
-            ApplyEvents {
-                events: vec![ApplyEvent {
-                    key: self.wrap_key(key),
-                    value,
-                    cf: cf.to_owned(),
-                    cmd_type: CmdType::Put,
-                }],
-                region_id: self.region_id,
-                region_resolved_ts: self.region_resolved_ts,
-            }
+        fn put_event(&mut self, cf: &'static str, key: Vec<u8>, value: Vec<u8>) {
+            self.events.push(ApplyEvent {
+                key: self.wrap_key(key),
+                value,
+                cf,
+                cmd_type: CmdType::Put,
+            })
         }
 
-        fn delete_event(&self, cf: &'static str, key: Vec<u8>) -> ApplyEvents {
-            ApplyEvents {
-                events: vec![ApplyEvent {
-                    key: self.wrap_key(key),
-                    value: vec![],
-                    cf: cf.to_owned(),
-                    cmd_type: CmdType::Delete,
-                }],
-                region_id: self.region_id,
-                region_resolved_ts: self.region_resolved_ts,
-            }
+        fn delete_event(&mut self, cf: &'static str, key: Vec<u8>) {
+            self.events.push(ApplyEvent {
+                key: self.wrap_key(key),
+                value: vec![],
+                cf,
+                cmd_type: CmdType::Delete,
+            })
         }
 
         fn put_table(&mut self, cf: &'static str, table: i64, key: &[u8], value: &[u8]) {
             let table_key = make_table_key(table, key);
-            self.events
-                .push(self.put_event(cf, table_key, value.to_vec()));
+            self.put_event(cf, table_key, value.to_vec());
         }
 
         fn delete_table(&mut self, cf: &'static str, table: i64, key: &[u8]) {
             let table_key = make_table_key(table, key);
-            self.events.push(self.delete_event(cf, table_key));
+            self.delete_event(cf, table_key);
         }
 
-        fn flush_events(&mut self) -> Vec<ApplyEvents> {
-            std::mem::take(&mut self.events)
+        fn flush_events(&mut self) -> ApplyEvents {
+            let region_id = self.events.region_id;
+            let region_resolved_ts = self.events.region_resolved_ts;
+            std::mem::replace(
+                &mut self.events,
+                ApplyEvents {
+                    events: vec![],
+                    region_id,
+                    region_resolved_ts,
+                },
+            )
         }
     }
 
@@ -1148,10 +1124,9 @@ mod tests {
         region1.delete_table(CF_DEFAULT, 1, b"hello");
         println!("{:?}", region1);
         let events = region1.flush_events();
-        for event in events {
-            router.on_events(event).await?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        router.on_events(events).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         let end_ts = TimeStamp::physical_now();
         let files = router.tasks.lock().await.get("dummy").unwrap().clone();
         println!("{:?}", files);
