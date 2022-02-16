@@ -340,7 +340,7 @@ impl SSTImporter {
             event_iter.next()?;
             let iter_key = event_iter.key().to_vec();
 
-            let ts = Key::from_encoded(iter_key.clone()).decode_ts()?;
+            let ts = Key::decode_ts_from(&iter_key)?;
             if ts > TimeStamp::new(meta.get_restore_ts()) {
                 // we assume the keys in file are sorted by ts. 
                 // so if we met the key not satisfy the ts. 
@@ -352,7 +352,6 @@ impl SSTImporter {
                 || Some(iter_key.clone()),
                 |v: Vec<u8>| Some(v.min(iter_key.clone())),
             );
-
 
             largest_key = largest_key.map_or_else(
                 || Some(iter_key.clone()),
