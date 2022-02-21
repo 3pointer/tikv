@@ -428,6 +428,7 @@ dependencies = [
  "log_wrappers",
  "online_config",
  "openssl",
+ "pd_client",
  "prometheus",
  "protobuf",
  "raft",

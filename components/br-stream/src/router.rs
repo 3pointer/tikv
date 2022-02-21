@@ -315,7 +315,7 @@ impl RouterInner {
     }
 
     pub async fn unregister_task(&self, task_name: &str) {
-        if let Some(_) = self.tasks.lock().await.remove(task_name) {
+        if self.tasks.lock().await.remove(task_name).is_some() {
             info!(
                 "backup stream unregister task";
                 "task" => task_name,
@@ -380,11 +380,16 @@ impl RouterInner {
 
     /// flush the specified task, once once success, return the min resolved ts of this flush.
     /// returns `None` if failed.
-    pub async fn do_flush(&self, task_name: &str, store_id: u64) -> Option<u64> {
+    pub async fn do_flush(
+        &self,
+        task_name: &str,
+        store_id: u64,
+        resolve_to: TimeStamp,
+    ) -> Option<u64> {
         debug!("backup stream do flush"; "task" => task_name);
         match self.tasks.lock().await.get(task_name) {
             Some(task_info) => {
-                let result = task_info.do_flush(store_id).await;
+                let result = task_info.do_flush(store_id, resolve_to).await;
                 if let Err(ref e) = result {
                     warn!("backup steam do flush fail"; "err" => ?e);
                 }
@@ -726,18 +731,27 @@ impl StreamTaskInfo {
 
     /// execute the flush: copy local files to external storage.
     /// if success, return the last resolved ts of this flush.
-    pub async fn do_flush(&self, store_id: u64) -> Result<Option<u64>> {
+    /// The caller can try to advance the resolved ts and provide it to the function,
+    /// and we would use max(resolved_ts_provided, resolved_ts_from_file).
+    pub async fn do_flush(
+        &self,
+        store_id: u64,
+        resolved_ts_provided: TimeStamp,
+    ) -> Result<Option<u64>> {
         // do nothing if not flushing status.
         if !self.is_flushing() {
             return Ok(None);
         }
 
         // generage meta data and prepare to flush to storage
-        let metadata_info = self
+        let mut metadata_info = self
             .move_to_flushing_files()
             .await
             .generate_metadata(store_id)
             .await?;
+        metadata_info.min_resolved_ts = metadata_info
+            .min_resolved_ts
+            .max(resolved_ts_provided.into_inner());
         let rts = metadata_info.min_resolved_ts;
 
         // flush log file to storage.
