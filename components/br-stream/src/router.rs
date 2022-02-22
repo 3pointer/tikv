@@ -327,6 +327,11 @@ impl RouterInner {
         }
     }
 
+    fn unregister_ranges(&self, task_name: &str) {
+        let mut ranges = self.ranges.write().unwrap();
+        ranges.get_inner().retain(|_, v| v.item != task_name);
+    }
+
     // register task info ans range info to router
     pub async fn register_task(
         &self,
@@ -347,6 +352,16 @@ impl RouterInner {
         self.register_ranges(&task_name, ranges);
 
         Ok(())
+    }
+
+    pub async fn unregister_task(&self, task_name: &str) {
+        if let Some(_) = self.tasks.lock().await.remove(task_name) {
+            info!(
+                "backup stream unregister task";
+                "task" => task_name,
+            );
+            self.unregister_ranges(task_name);
+        }
     }
 
     /// get the task name by a key.
@@ -831,7 +846,7 @@ impl MetadataInfo {
         let mut metadata = Metadata::new();
         metadata.set_files(self.files.into());
         metadata.set_store_id(self.store_id as _);
-        metadata.set_resloved_ts(self.min_resolved_ts as _);
+        metadata.set_resolved_ts(self.min_resolved_ts as _);
 
         metadata
             .write_to_bytes()

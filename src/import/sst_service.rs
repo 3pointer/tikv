@@ -166,6 +166,11 @@ where
         let router = self.router.clone();
         let importer = self.importer.clone();
         async move {
+            // check api version
+            if !importer.as_ref().check_api_version(&ssts)? {
+                return Err(Error::IncompatibleApiVersion);
+            }
+
             let mut resp = IngestResponse::default();
             let res = match snapshot_res.await {
                 Ok(snap) => snap,
@@ -384,10 +389,9 @@ where
                 .observe(start.saturating_elapsed().as_secs_f64());
 
             let res = importer.apply::<E>(
+                req.get_meta(),
                 req.get_storage_backend(),
-                req.get_name(),
                 req.get_rewrite_rule(),
-                req.get_cf(),
                 limiter,
                 engine,
             );
