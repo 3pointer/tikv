@@ -407,9 +407,7 @@ impl RouterInner {
     pub async fn tick(&self) {
         for (name, task_info) in self.tasks.lock().await.iter() {
             // if stream task need flush this time, schedule Task::Flush, or update time justly.
-            if task_info.should_flush().await
-                && task_info.set_flushing_status_cas(false, true).is_ok()
-            {
+            if task_info.should_flush() && task_info.set_flushing_status_cas(false, true).is_ok() {
                 info!(
                     "backup stream trigger flush task by tick";
                     "task" => ?task_info,
@@ -652,9 +650,8 @@ impl StreamTaskInfo {
         unsafe { Box::from_raw(ptr) };
     }
 
-    pub async fn should_flush(&self) -> bool {
+    pub fn should_flush(&self) -> bool {
         self.get_last_flush_time().saturating_elapsed() >= self.flush_interval
-            && !self.files.read().await.is_empty()
     }
 
     pub fn is_flushing(&self) -> bool {
@@ -743,7 +740,7 @@ impl StreamTaskInfo {
             return Ok(None);
         }
 
-        // generage meta data and prepare to flush to storage
+        // generate meta data and prepare to flush to storage
         let mut metadata_info = self
             .move_to_flushing_files()
             .await
@@ -753,6 +750,11 @@ impl StreamTaskInfo {
             .min_resolved_ts
             .max(resolved_ts_provided.into_inner());
         let rts = metadata_info.min_resolved_ts;
+
+        // There is no file to flush, don't write the meta file.
+        if metadata_info.files.is_empty() {
+            return Ok(Some(rts));
+        }
 
         // flush log file to storage.
         self.flush_log().await?;

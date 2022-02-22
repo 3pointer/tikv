@@ -358,16 +358,17 @@ where
     }
 
     /// try advance the resolved ts by the pd tso.
-    async fn try_resolve(
-        pd_client: Arc<PDC>,
-        resolvers: Arc<DashMap<u64, Resolver>>,
-    ) -> Result<TimeStamp> {
-        let tso = pd_client.get_tso().await?;
+    async fn try_resolve(pd_client: Arc<PDC>, resolvers: Arc<DashMap<u64, Resolver>>) -> TimeStamp {
+        let tso = pd_client
+            .get_tso()
+            .await
+            .map_err(|err| Error::from(err).report("failed to get tso from pd"))
+            .unwrap_or_default();
         let new_tso = resolvers
             .iter_mut()
             .map(|mut r| r.value_mut().resolve(tso))
             .min();
-        Ok(new_tso.unwrap_or_default())
+        new_tso.unwrap_or_default()
     }
 
     pub fn on_flush(&self, task: String, store_id: u64) {
@@ -382,10 +383,7 @@ where
         self.pool.spawn(async move {
             // NOTE: Maybe push down the resolve step to the router?
             //       Or if there are too many duplicated `Flush` command, we may do some useless works.
-            let new_rts = Self::try_resolve(pd_cli.clone(), resolvers)
-                .await
-                .map_err(|err| err.report("failed to resolve resolved ts on flushing."))
-                .unwrap_or_default();
+            let new_rts = Self::try_resolve(pd_cli.clone(), resolvers).await;
             if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
                 if let Err(err) = pd_cli
                     .update_service_safe_point(
