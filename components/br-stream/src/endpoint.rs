@@ -402,13 +402,16 @@ where
                 self.resolvers.as_ref().remove(&region.id);
             }
             ObserveOp::RefreshResolver { region } => {
-                self.observer.subs.deregister_region(region.id);
+                let canceled = self.observer.subs.deregister_region(region.id);
                 self.resolvers.as_ref().remove(&region.id);
-                if let Err(e) = self.observe_over(&region) {
-                    e.report(format!(
-                        "register region {} to raftstore when refreshing",
-                        region.get_id()
-                    ));
+
+                if canceled {
+                    if let Err(e) = self.observe_over(&region) {
+                        e.report(format!(
+                            "register region {} to raftstore when refreshing",
+                            region.get_id()
+                        ));
+                    }
                 }
             }
         }
