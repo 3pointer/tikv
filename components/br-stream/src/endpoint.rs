@@ -380,6 +380,7 @@ where
             //       Or if there are too many duplicated `Flush` command, we may do some useless works.
             let new_rts = Self::try_resolve(pd_cli.clone(), resolvers).await;
             if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
+                info!("flushing and refreshing checkpoint ts."; "checkpoint_ts" => %rts);
                 if rts == 0 {
                     // We cannot advance the resolved ts for now.
                     return;
