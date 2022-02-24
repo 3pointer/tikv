@@ -362,7 +362,7 @@ where
             .iter_mut()
             .map(|mut r| r.value_mut().resolve(tso))
             .min();
-        info!("try resolve"; "new_tso" => ?new_tso);
+        debug!("try resolve resolved ts from PD"; "new_tso" => ?new_tso);
         new_tso.unwrap_or_default()
     }
 
@@ -380,7 +380,7 @@ where
             //       Or if there are too many duplicated `Flush` command, we may do some useless works.
             let new_rts = Self::try_resolve(pd_cli.clone(), resolvers).await;
             if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
-                info!("flushing and refreshing checkpoint ts."; "checkpoint_ts" => %rts);
+                info!("flushing and refreshing checkpoint ts."; "checkpoint_ts" => %rts, "task" => %task);
                 if rts == 0 {
                     // We cannot advance the resolved ts for now.
                     return;

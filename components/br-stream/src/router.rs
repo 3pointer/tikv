@@ -1010,7 +1010,7 @@ struct TaskRange {
 mod tests {
     use crate::utils;
 
-    use kvproto::brpb::{Local, StorageBackend, StreamBackupTaskInfo};
+    use kvproto::brpb::{Local, Noop, StorageBackend, StreamBackupTaskInfo};
 
     use std::time::Duration;
     use tikv_util::{
@@ -1134,6 +1134,13 @@ mod tests {
         sb
     }
 
+    fn create_noop_storage_backend() -> StorageBackend {
+        let nop = Noop::new();
+        let mut backend = StorageBackend::default();
+        backend.set_noop(nop);
+        backend
+    }
+
     #[tokio::test]
     async fn test_basic_file() -> Result<()> {
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
@@ -1233,5 +1240,25 @@ mod tests {
         assert_eq!(meta_count, 1);
         assert_eq!(log_count, 3);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_empty_resolved_ts() {
+        let (tx, rx) = dummy_scheduler();
+        let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
+        let router = RouterInner::new(tmp.clone(), tx, 32);
+        let mut stream_task = StreamBackupTaskInfo::default();
+        stream_task.set_name("nothing".to_string());
+        stream_task.set_storage(create_noop_storage_backend());
+
+        router
+            .register_task(StreamTask { info: stream_task }, vec![])
+            .await
+            .unwrap();
+        let task = router.get_task_info("nothing").await.unwrap();
+        task.set_flushing_status_cas(false, true).unwrap();
+        let ts = TimeStamp::compose(TimeStamp::physical_now(), 42);
+        let rts = router.do_flush("nothing", 1, ts).await.unwrap();
+        assert_eq!(ts.into_inner(), rts);
     }
 }
