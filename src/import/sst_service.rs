@@ -28,7 +28,7 @@ use protobuf::Message;
 
 use crate::server::CONFIG_ROCKSDB_GAUGE;
 use raftstore::router::RaftStoreRouter;
-use raftstore::store::{Callback, Config as RaftConfig, RaftCmdExtraOpts, RegionSnapshot};
+use raftstore::store::{Callback, RaftCmdExtraOpts, RegionSnapshot};
 use tikv_util::config::ReadableSize;
 use tikv_util::future::create_stream_with_buffer;
 use tikv_util::future::paired_future_callback;
@@ -69,6 +69,7 @@ where
 {
     pub fn new(
         cfg: Config,
+        raft_entry_max_size: ReadableSize,
         router: Router,
         engine: E,
         importer: Arc<SSTImporter>,
@@ -94,7 +95,7 @@ where
             importer,
             limiter: Limiter::new(f64::INFINITY),
             task_slots: Arc::new(Mutex::new(HashSet::default())),
-            raft_entry_max_size: RaftConfig::default().raft_entry_max_size,
+            raft_entry_max_size,
         }
     }
 
@@ -448,57 +449,47 @@ where
         let context = req.take_context();
         let meta = req.get_meta();
 
-        match importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter) {
-            Ok(temp_file) => {
-                let mut reqs = vec![];
-                let mut cmd_reqs = vec![];
-                let mut build_req_fn = self.build_apply_request(
-                    reqs.as_mut(),
-                    cmd_reqs.as_mut(),
-                    meta.get_is_delete(),
-                    meta.get_cf(),
-                    context.clone(),
-                );
-                match importer.do_apply_kv_file(
-                    meta.get_restore_ts(),
-                    temp_file,
-                    req.get_rewrite_rule(),
-                    &mut build_req_fn,
-                ) {
-                    Ok(range) => {
-                        drop(build_req_fn);
-                        if !reqs.is_empty() {
-                            let cmd = make_request(reqs.as_mut(), context);
-                            cmd_reqs.push(cmd);
-                        }
-                        for cmd in cmd_reqs {
-                            let (cb, future) = paired_future_callback();
-                            match router.send_command(
-                                cmd,
-                                Callback::write(cb),
-                                RaftCmdExtraOpts::default(),
-                            ) {
-                                Ok(_) => futs.push(future),
-                                Err(_e) => {
-                                    let mut import_err = kvproto::import_sstpb::Error::default();
-                                    import_err
-                                        .set_message("failed to send raft command".to_string());
-                                    apply_resp.set_error(import_err);
-                                }
-                            }
-                        }
-                        if let Some(r) = range {
-                            apply_resp.set_range(r);
-                        }
-                    }
+        let result = (|| -> Result<()> {
+            let temp_file =
+                importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter)?;
+            let mut reqs = vec![];
+            let mut cmd_reqs = vec![];
+            let mut build_req_fn = self.build_apply_request(
+                reqs.as_mut(),
+                cmd_reqs.as_mut(),
+                meta.get_is_delete(),
+                meta.get_cf(),
+                context.clone(),
+            );
+            let range = importer.do_apply_kv_file(
+                meta.get_restore_ts(),
+                temp_file,
+                req.get_rewrite_rule(),
+                &mut build_req_fn,
+            )?;
+            drop(build_req_fn);
+            if !reqs.is_empty() {
+                let cmd = make_request(reqs.as_mut(), context);
+                cmd_reqs.push(cmd);
+            }
+            for cmd in cmd_reqs {
+                let (cb, future) = paired_future_callback();
+                match router.send_command(cmd, Callback::write(cb), RaftCmdExtraOpts::default()) {
+                    Ok(_) => futs.push(future),
                     Err(e) => {
-                        apply_resp.set_error(e.into());
+                        let mut import_err = kvproto::import_sstpb::Error::default();
+                        import_err.set_message(format!("failed to send raft command: {}", e));
+                        apply_resp.set_error(import_err);
                     }
                 }
             }
-            Err(e) => {
-                apply_resp.set_error(e.into());
+            if let Some(r) = range {
+                apply_resp.set_range(r);
             }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            apply_resp.set_error(e.into());
         }
 
         let handle_task = async move {
@@ -506,18 +497,14 @@ where
             sst_importer::metrics::IMPORTER_APPLY_DURATION
                 .with_label_values(&["queue"])
                 .observe(start.saturating_elapsed().as_secs_f64());
-            let resp = if !futs.is_empty() {
-                Ok(join_all(futs).await.iter().fold(apply_resp, |mut resp, x| {
-                    if x.is_err() {
-                        let mut import_err = kvproto::import_sstpb::Error::default();
-                        import_err.set_message("failed to complete raft command".to_string());
-                        resp.set_error(import_err);
-                    }
-                    resp
-                }))
-            } else {
-                Ok(apply_resp)
-            };
+            let resp = Ok(join_all(futs).await.iter().fold(apply_resp, |mut resp, x| {
+                if let Err(e) = x {
+                    let mut import_err = kvproto::import_sstpb::Error::default();
+                    import_err.set_message(format!("failed to complete raft command: {}", e));
+                    resp.set_error(import_err);
+                }
+                resp
+            }));
             // Records how long the apply task waits to be scheduled.
             sst_importer::metrics::IMPORTER_APPLY_DURATION
                 .with_label_values(&["finish"])
