@@ -89,20 +89,24 @@ impl SubscriptionTracer {
         }
     }
 
-    pub fn deregister_region(&self, region_id: u64) {
+    /// try to mark a region no longer be tracked by this observer.
+    /// returns whether success (it failed if the region hasn't been observed when calling this.)
+    pub fn deregister_region(&self, region_id: u64) -> bool {
         match self.0.remove(&region_id) {
             Some(o) => {
                 o.1.stop_observing();
                 info!("stop listen stream from store"; "observer" => ?o.1, "region_id"=> %region_id);
+                true
             }
             None => {
                 warn!("trying to deregister region not registered"; "region_id" => %region_id);
+                false
             }
         }
     }
 
     /// check whether the region_id should be observed by this observer.
-    pub fn should_observe(&self, region_id: u64) -> bool {
+    pub fn is_observing(&self, region_id: u64) -> bool {
         let mut exists = false;
 
         // The region traced, check it whether is still be observing,
@@ -147,7 +151,7 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
                 !cb.is_empty()
                     && cb.level == ObserveLevel::All
                     // Once the observe has been canceled by outside things, we should be able to stop.
-                    && self.subs.should_observe(cb.region_id)
+                    && self.subs.is_observing(cb.region_id)
             })
             .cloned()
             .collect();
@@ -185,7 +189,7 @@ impl RegionChangeObserver for BackupStreamObserver {
         _role: StateRole,
     ) {
         match event {
-            RegionChangeEvent::Destroy if self.subs.should_observe(ctx.region().get_id()) => {
+            RegionChangeEvent::Destroy if self.subs.is_observing(ctx.region().get_id()) => {
                 try_send!(
                     self.scheduler,
                     Task::ModifyObserve(ObserveOp::Stop {
@@ -193,7 +197,7 @@ impl RegionChangeObserver for BackupStreamObserver {
                     })
                 );
             }
-            RegionChangeEvent::Update => {
+            RegionChangeEvent::Update if self.subs.is_observing(ctx.region().get_id()) => {
                 try_send!(
                     self.scheduler,
                     Task::ModifyObserve(ObserveOp::RefreshResolver {
@@ -265,9 +269,9 @@ mod tests {
         } else {
             panic!("unexpected message received: it is {}", task);
         }
-        assert!(o.subs.should_observe(42));
+        assert!(o.subs.is_observing(42));
         handle.stop_observing();
-        assert!(!o.subs.should_observe(42));
+        assert!(!o.subs.is_observing(42));
     }
 
     #[test]
@@ -317,14 +321,14 @@ mod tests {
         o.on_role_change(&mut ctx, StateRole::Leader);
         let task = rx.recv_timeout(Duration::from_millis(20));
         assert!(task.is_err(), "it is {:?}", task);
-        assert!(!o.subs.should_observe(43));
+        assert!(!o.subs.is_observing(43));
 
         // Test newly created region out of range won't be added to observe list.
         let mut ctx = ObserverContext::new(&r);
         o.on_region_changed(&mut ctx, RegionChangeEvent::Create, StateRole::Leader);
         let task = rx.recv_timeout(Duration::from_millis(20));
         assert!(task.is_err(), "it is {:?}", task);
-        assert!(!o.subs.should_observe(43));
+        assert!(!o.subs.is_observing(43));
 
         // Test give up subscripting when become follower.
         let r = fake_region(42, b"0008", b"0009");
