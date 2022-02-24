@@ -518,6 +518,11 @@ where
             } else {
                 Ok(apply_resp)
             };
+            // Records how long the apply task waits to be scheduled.
+            sst_importer::metrics::IMPORTER_APPLY_DURATION
+                .with_label_values(&["finish"])
+                .observe(start.saturating_elapsed().as_secs_f64());
+            debug!("finished apply kv file with {:?}", resp);
             crate::send_rpc_response!(resp, sink, label, timer);
         };
         self.threads.spawn_ok(handle_task);
