@@ -797,12 +797,12 @@ impl StreamTaskInfo {
             .await?;
         metadata_info.min_resolved_ts = metadata_info
             .min_resolved_ts
-            .max(resolved_ts_provided.into_inner());
+            .max(Some(resolved_ts_provided.into_inner()));
         let rts = metadata_info.min_resolved_ts;
 
         // There is no file to flush, don't write the meta file.
         if metadata_info.files.is_empty() {
-            return Ok(Some(rts));
+            return Ok(rts);
         }
 
         // flush log file to storage.
@@ -813,7 +813,7 @@ impl StreamTaskInfo {
 
         // clear flushing files
         self.clear_flushing_files().await;
-        Ok(Some(rts))
+        Ok(rts)
     }
 }
 
@@ -835,7 +835,7 @@ struct DataFile {
 #[derive(Debug)]
 pub struct MetadataInfo {
     pub files: Vec<DataFileInfo>,
-    pub min_resolved_ts: u64,
+    pub min_resolved_ts: Option<u64>,
     pub store_id: u64,
 }
 
@@ -843,7 +843,7 @@ impl MetadataInfo {
     fn with_capacity(cap: usize) -> Self {
         Self {
             files: Vec::with_capacity(cap),
-            min_resolved_ts: u64::MAX,
+            min_resolved_ts: None,
             store_id: 0,
         }
     }
@@ -854,7 +854,7 @@ impl MetadataInfo {
 
     fn push(&mut self, file: DataFileInfo) {
         let rts = file.resolved_ts;
-        self.min_resolved_ts = self.min_resolved_ts.min(rts);
+        self.min_resolved_ts = self.min_resolved_ts.map_or(Some(rts), |r| Some(r.min(rts)));
         self.files.push(file);
     }
 
@@ -862,7 +862,7 @@ impl MetadataInfo {
         let mut metadata = Metadata::new();
         metadata.set_files(self.files.into());
         metadata.set_store_id(self.store_id as _);
-        metadata.set_resolved_ts(self.min_resolved_ts as _);
+        metadata.set_resolved_ts(self.min_resolved_ts.unwrap_or_default() as _);
 
         metadata
             .write_to_bytes()
@@ -873,7 +873,7 @@ impl MetadataInfo {
         format!(
             // "/v1/backupmeta/{:012}-{}.meta",
             "v1_backupmeta_{:012}-{}.meta",
-            self.min_resolved_ts,
+            self.min_resolved_ts.unwrap_or_default(),
             uuid::Uuid::new_v4()
         )
     }
