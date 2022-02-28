@@ -68,9 +68,16 @@ impl BackupStreamObserver {
 
     /// Test whether a region should be observed by the observer.
     fn should_register_region(&self, region: &Region) -> bool {
+        // If the end key is empty, it actually meant infinity.
+        // However, this way is a little hacky, maybe we'd better make a
+        // `RangesBound<R>` version for `is_overlapping`.
+        let mut end_key = region.get_end_key();
+        if end_key.is_empty() {
+            end_key = &[0xffu8; 32];
+        }
         self.ranges
             .rl()
-            .is_overlapping((region.get_start_key(), region.get_end_key()))
+            .is_overlapping((region.get_start_key(), end_key))
     }
 }
 
@@ -233,6 +240,16 @@ mod tests {
 
     use super::BackupStreamObserver;
 
+    macro_rules! assert_let {
+        (let $p:pat = $e:expr; $cc:tt) => {
+            if let $p = $e {
+                $cc
+            } else {
+                panic!("{} doesn't matches {}", stringify!($e), stringify!($p))
+            }
+        };
+    }
+
     fn fake_region(id: u64, start: &[u8], end: &[u8]) -> Region {
         let mut r = Region::new();
         r.set_id(id);
@@ -278,11 +295,9 @@ mod tests {
         o.register_region(&r);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
         let handle = ObserveHandle::new();
-        if let Task::ModifyObserve(ObserveOp::Start { region }) = task {
+        assert_let!(let Task::ModifyObserve(ObserveOp::Start { region }) = task; {
             o.subs.register_region(region.get_id(), handle.clone())
-        } else {
-            panic!("unexpected message received: it is {}", task);
-        }
+        });
 
         // Test events with key in the range can be observed.
         let observe_info = CmdObserveInfo::from_handle(handle.clone(), ObserveHandle::new());
@@ -291,13 +306,11 @@ mod tests {
         let mut cmd_batches = vec![cb];
         o.on_flush_applied_cmd_batch(ObserveLevel::All, &mut cmd_batches, &mock_engine);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
-        if let Task::BatchEvent(batches) = task {
+        assert_let!(let Task::BatchEvent(batches) = task; {
             assert!(batches.len() == 1);
             assert!(batches[0].region_id == 42);
             assert!(batches[0].cdc_id == handle.id);
-        } else {
-            panic!("unexpected message received: it is {}", task);
-        }
+        });
 
         // Test event from other region should not be send.
         let observe_info = CmdObserveInfo::from_handle(ObserveHandle::new(), ObserveHandle::new());
@@ -317,7 +330,7 @@ mod tests {
         assert!(task.is_err(), "it is {:?}", task);
         assert!(!o.subs.is_observing(43));
 
-        // Test region out of range won't be added to observe list.
+        // Test newly created region out of range won't be added to observe list.
         let mut ctx = ObserverContext::new(&r);
         o.on_region_changed(&mut ctx, RegionChangeEvent::Create, StateRole::Leader);
         let task = rx.recv_timeout(Duration::from_millis(20));
@@ -329,7 +342,8 @@ mod tests {
         let mut ctx = ObserverContext::new(&r);
         o.on_role_change(&mut ctx, StateRole::Follower);
         let task = rx.recv_timeout(Duration::from_millis(20));
-        assert!(task.is_err(), "it is {:?}", task);
-        assert!(!o.subs.should_observe(42));
+        assert_let!(let Ok(Some(Task::ModifyObserve(ObserveOp::Stop { region, .. }))) = task; {
+            assert_eq!(region.id, 42);
+        });
     }
 }
