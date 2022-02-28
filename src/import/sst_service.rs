@@ -856,6 +856,6 @@ fn make_request(reqs: &mut Vec<Request>, context: Context) -> RaftCmdRequest {
     let mut cmd = RaftCmdRequest::default();
     let header = make_request_header(context);
     cmd.set_header(header);
-    cmd.set_requests(reqs.drain(..).collect());
+    cmd.set_requests(std::mem::take(reqs).into());
     cmd
 }
