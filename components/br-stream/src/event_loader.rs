@@ -118,7 +118,6 @@ pub struct InitialDataLoader<E, R, RT> {
     // Note: maybe we can make it an abstract thing like `EventSink` with
     //       method `async (KvEvent) -> Result<()>`?
     sink: Router,
-    store_id: u64,
 
     _engine: PhantomData<E>,
 }
@@ -129,12 +128,11 @@ where
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E>,
 {
-    pub fn new(router: RT, regions: R, sink: Router, store_id: u64) -> Self {
+    pub fn new(router: RT, regions: R, sink: Router) -> Self {
         Self {
             router,
             regions,
             sink,
-            store_id,
             _engine: PhantomData,
         }
     }

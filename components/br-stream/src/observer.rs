@@ -193,10 +193,22 @@ impl RegionChangeObserver for BackupStreamObserver {
         &self,
         ctx: &mut ObserverContext<'_>,
         event: RegionChangeEvent,
-        _role: StateRole,
+        role: StateRole,
     ) {
+        if !self.subs.is_observing(ctx.region().get_id()) {
+            return;
+        }
+        if role != StateRole::Leader {
+            try_send!(
+                self.scheduler,
+                Task::ModifyObserve(ObserveOp::Stop {
+                    region: ctx.region().clone(),
+                })
+            );
+            return;
+        }
         match event {
-            RegionChangeEvent::Destroy if self.subs.is_observing(ctx.region().get_id()) => {
+            RegionChangeEvent::Destroy => {
                 try_send!(
                     self.scheduler,
                     Task::ModifyObserve(ObserveOp::Stop {
@@ -204,7 +216,7 @@ impl RegionChangeObserver for BackupStreamObserver {
                     })
                 );
             }
-            RegionChangeEvent::Update if self.subs.is_observing(ctx.region().get_id()) => {
+            RegionChangeEvent::Update => {
                 try_send!(
                     self.scheduler,
                     Task::ModifyObserve(ObserveOp::RefreshResolver {

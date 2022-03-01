@@ -227,7 +227,6 @@ where
             self.router.clone(),
             self.regions.clone(),
             self.range_router.clone(),
-            self.store_id,
         )
     }
 
