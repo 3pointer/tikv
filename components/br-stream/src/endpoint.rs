@@ -143,7 +143,7 @@ where
     async fn starts_flush_ticks(router: Router) {
         let ticker = tick(Duration::from_secs(FLUSH_STORAGE_INTERVAL / 5));
         loop {
-            // wait 10s to trigger tick
+            // wait 1min to trigger tick
             let _ = ticker.recv().unwrap();
             debug!("backup stream trigger flush tick");
             router.tick().await;
@@ -193,6 +193,9 @@ where
 
         let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut());
         drop(resolver);
+        if kvs.len() == 0 {
+            return;
+        }
 
         HANDLE_EVENT_DURATION_HISTOGRAM
             .with_label_values(&["to_stream_event"])
@@ -230,7 +233,6 @@ where
             self.router.clone(),
             self.regions.clone(),
             self.range_router.clone(),
-            self.store_id,
         )
     }
 

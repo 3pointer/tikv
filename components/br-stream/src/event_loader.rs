@@ -112,13 +112,13 @@ impl<S: Snapshot> EventLoader<S> {
 /// Like [`cdc::Initializer`], but supports initialize over range.
 /// Note: maybe we can merge those two structures?
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct InitialDataLoader<E, R, RT> {
     router: RT,
     regions: R,
     // Note: maybe we can make it an abstract thing like `EventSink` with
     //       method `async (KvEvent) -> Result<()>`?
     sink: Router,
-    store_id: u64,
 
     _engine: PhantomData<E>,
 }
@@ -129,12 +129,11 @@ where
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E>,
 {
-    pub fn new(router: RT, regions: R, sink: Router, store_id: u64) -> Self {
+    pub fn new(router: RT, regions: R, sink: Router) -> Self {
         Self {
             router,
             regions,
             sink,
-            store_id,
             _engine: PhantomData,
         }
     }

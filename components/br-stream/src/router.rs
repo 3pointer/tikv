@@ -427,7 +427,8 @@ impl RouterInner {
         resolve_to: TimeStamp,
     ) -> Option<u64> {
         debug!("backup stream do flush"; "task" => task_name);
-        match self.tasks.lock().await.get(task_name) {
+        let task = self.tasks.lock().await.get(task_name).cloned();
+        match task {
             Some(task_info) => {
                 let result = task_info.do_flush(store_id, resolve_to).await;
                 if let Err(ref e) = result {
@@ -1001,6 +1002,7 @@ impl std::fmt::Debug for DataFile {
 struct KeyRange(Vec<u8>);
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct TaskRange {
     end: Vec<u8>,
     task_name: String,
