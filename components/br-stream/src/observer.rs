@@ -252,16 +252,6 @@ mod tests {
 
     use super::BackupStreamObserver;
 
-    macro_rules! assert_let {
-        (let $p:pat = $e:expr; $cc:tt) => {
-            if let $p = $e {
-                $cc
-            } else {
-                panic!("{} doesn't matches {}", stringify!($e), stringify!($p))
-            }
-        };
-    }
-
     fn fake_region(id: u64, start: &[u8], end: &[u8]) -> Region {
         let mut r = Region::new();
         r.set_id(id);
@@ -318,7 +308,6 @@ mod tests {
         let mut cmd_batches = vec![cb];
         o.on_flush_applied_cmd_batch(ObserveLevel::All, &mut cmd_batches, &mock_engine);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
-
         assert_matches!(task, Task::BatchEvent(batches) => {
             assert!(batches.len() == 1);
             assert!(batches[0].region_id == 42);
@@ -355,7 +344,6 @@ mod tests {
         let mut ctx = ObserverContext::new(&r);
         o.on_role_change(&mut ctx, StateRole::Follower);
         let task = rx.recv_timeout(Duration::from_millis(20));
-      
         assert_matches!(task, Ok(Some(Task::ModifyObserve(ObserveOp::Stop { region, .. }))) => {
             assert_eq!(region.id, 42);
         });
