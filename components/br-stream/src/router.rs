@@ -1246,7 +1246,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_resolved_ts() {
-        let (tx, rx) = dummy_scheduler();
+        let (tx, _rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
         let router = RouterInner::new(tmp.clone(), tx, 32);
         let mut stream_task = StreamBackupTaskInfo::default();
