@@ -460,7 +460,7 @@ where
         let result = (|| -> Result<()> {
             let temp_file =
                 importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter)?;
-            let mut reqs: HashMap<Vec<u8>, Request> = HashMap::default();
+            let mut reqs = HashMap::<Vec<u8>, Request>::default();
             let mut cmd_reqs = vec![];
             let mut build_req_fn = self.build_apply_request(
                 &mut reqs,
