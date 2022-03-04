@@ -15,9 +15,9 @@ use kvproto::import_sstpb::*;
 use encryption::{encryption_method_to_db_encryption_method, DataKeyManager};
 use engine_rocks::{get_env, RocksSstReader};
 use engine_traits::{
-    name_to_cf, CfName, EncryptionKeyManager, FileEncryptionInfo, Iterator, KvEngine, SSTMetaInfo,
-    SeekKey, SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT,
-    CF_WRITE,
+    name_to_cf, util::check_key_in_range, CfName, EncryptionKeyManager, FileEncryptionInfo,
+    Iterator, KvEngine, SSTMetaInfo, SeekKey, SstCompressionType, SstExt, SstReader, SstWriter,
+    SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
 use file_system::{get_io_rate_limiter, OpenOptions};
 use kvproto::kvrpcpb::ApiVersion;
@@ -292,6 +292,8 @@ impl SSTImporter {
 
     pub fn do_apply_kv_file<P: AsRef<Path>>(
         &self,
+        start_key: &[u8],
+        end_key: &[u8],
         restore_ts: u64,
         file_path: P,
         rewrite_rule: &RewriteRule,
@@ -323,6 +325,15 @@ impl SSTImporter {
             }
             event_iter.next()?;
             let iter_key = event_iter.key().to_vec();
+
+            if check_key_in_range(&iter_key, 0, start_key, end_key).is_err() {
+                // key not in range, we can simply skip this key here.
+                // the client make sure the correct region will download and apply the same file.
+                INPORTER_APPLY_COUNT
+                    .with_label_values(&["key_not_in_region"])
+                    .inc();
+                continue;
+            }
 
             let ts = Key::decode_ts_from(&iter_key)?;
             if ts > TimeStamp::new(restore_ts) {

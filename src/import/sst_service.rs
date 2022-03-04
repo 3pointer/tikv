@@ -470,6 +470,8 @@ where
                 context.clone(),
             );
             let range = importer.do_apply_kv_file(
+                meta.get_start_key(),
+                meta.get_end_key(),
                 meta.get_restore_ts(),
                 temp_file,
                 req.get_rewrite_rule(),
