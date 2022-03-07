@@ -453,6 +453,11 @@ where
         let raft_size = self.raft_entry_max_size;
 
         let handle_task = async move {
+            // Records how long the apply task waits to be scheduled.
+            sst_importer::metrics::IMPORTER_APPLY_DURATION
+                .with_label_values(&["queue"])
+                .observe(start.saturating_elapsed().as_secs_f64());
+
             let mut futs = vec![];
             let mut apply_resp = ApplyResponse::default();
             let context = req.take_context();
@@ -505,10 +510,6 @@ where
                 apply_resp.set_error(e.into());
             }
 
-            // Records how long the apply task waits to be scheduled.
-            sst_importer::metrics::IMPORTER_APPLY_DURATION
-                .with_label_values(&["queue"])
-                .observe(start.saturating_elapsed().as_secs_f64());
             let resp = Ok(join_all(futs).await.iter().fold(apply_resp, |mut resp, x| {
                 if let Err(e) = x {
                     let mut import_err = kvproto::import_sstpb::Error::default();
