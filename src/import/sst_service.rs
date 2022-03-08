@@ -511,10 +511,22 @@ where
             }
 
             let resp = Ok(join_all(futs).await.iter().fold(apply_resp, |mut resp, x| {
-                if let Err(e) = x {
-                    let mut import_err = kvproto::import_sstpb::Error::default();
-                    import_err.set_message(format!("failed to complete raft command: {}", e));
-                    resp.set_error(import_err);
+                match x {
+                    Err(e) => {
+                        let mut import_err = kvproto::import_sstpb::Error::default();
+                        import_err.set_message(format!("failed to complete raft command: {}", e));
+                        resp.set_error(import_err);
+                    }
+                    Ok(r) => {
+                        if r.response.get_header().has_error() {
+                            let mut import_err = kvproto::import_sstpb::Error::default();
+                            let err = r.response.get_header().get_error();
+                            import_err
+                                .set_message(format!("failed to complete raft command: {:?}", err));
+                            warn!("failed to apply the file to the store"; "error" => ?err, "file" => %meta.get_name());
+                            resp.set_error(import_err);
+                        }
+                    }
                 }
                 resp
             }));
