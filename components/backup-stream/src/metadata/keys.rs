@@ -1,13 +1,13 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use bytes::BufMut;
 
-const PREFIX: &str = "/tidb/backup-stream";
+const PREFIX: &str = "/tidb/br-stream";
 const PATH_INFO: &str = "/info";
 const PATH_NEXT_BACKUP_TS: &str = "/checkpoint";
 const PATH_RANGES: &str = "/ranges";
 const PATH_PAUSE: &str = "/pause";
 // Note: maybe use something like `const_fmt` for concatenating constant strings?
-const TASKS_PREFIX: &str = "/tidb/backup-stream/info/";
+const TASKS_PREFIX: &str = "/tidb/br-stream/info/";
 
 /// A key that associates to some metadata.
 ///
