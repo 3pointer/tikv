@@ -1590,6 +1590,7 @@ dependencies = [
  "lazy_static",
  "libloading",
  "matches",
+ "openssl",
  "prometheus",
  "protobuf",
  "rand 0.8.3",

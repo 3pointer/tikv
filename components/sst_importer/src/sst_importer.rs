@@ -212,6 +212,7 @@ impl SSTImporter {
         src_file_name: &str,
         dst_file: std::path::PathBuf,
         backend: &StorageBackend,
+        expect_256: Option<Vec<u8>>,
         file_crypter: Option<FileEncryptionInfo>,
         speed_limiter: &Limiter,
     ) -> Result<()> {
@@ -235,6 +236,7 @@ impl SSTImporter {
             src_file_name,
             dst_file.clone(),
             file_length,
+            expect_256,
             speed_limiter,
             file_crypter,
         );
@@ -277,6 +279,7 @@ impl SSTImporter {
             name,
             path.temp.clone(),
             backend,
+            Some(meta.get_sha256().to_vec()),
             // don't support encrypt for now.
             None,
             speed_limiter,
@@ -416,6 +419,7 @@ impl SSTImporter {
             name,
             path.temp.clone(),
             backend,
+            None,
             file_crypter,
             speed_limiter,
         )?;
