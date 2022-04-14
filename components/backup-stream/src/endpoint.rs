@@ -21,6 +21,7 @@ use resolved_ts::Resolver;
 use tikv_util::time::Instant;
 
 use tokio::io::Result as TokioResult;
+use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 use tokio_stream::StreamExt;
 use txn_types::TimeStamp;
@@ -55,7 +56,7 @@ pub struct Endpoint<S: MetaStore + 'static, R, E, RT, PDC> {
     scheduler: Scheduler<Task>,
     #[allow(dead_code)]
     observer: BackupStreamObserver,
-    pool: Arc<Runtime>,
+    pool: Runtime,
     store_id: u64,
     regions: R,
     engine: PhantomData<E>,
@@ -84,10 +85,8 @@ where
         pd_client: Arc<PDC>,
         cm: ConcurrencyManager,
     ) -> Self {
-        let pool = Arc::new(
-            create_tokio_runtime(config.num_threads, "br-stream")
-                .expect("failed to create tokio runtime for backup stream worker."),
-        );
+        let pool = create_tokio_runtime(config.num_threads, "br-stream")
+            .expect("failed to create tokio runtime for backup stream worker.");
 
         // TODO consider TLS?
         let meta_client = Some(cli);
@@ -101,11 +100,10 @@ where
             // spawn a worker to watch task changes from etcd periodically.
             let meta_client_clone = meta_client.clone();
             let scheduler_clone = scheduler.clone();
-            let pool_clone = pool.clone();
             // TODO build a error handle mechanism #error 2
             pool.spawn(async {
                 if let Err(err) =
-                    Self::start_tasks(meta_client_clone, scheduler_clone, pool_clone).await
+                    Self::start_and_watch_tasks(meta_client_clone, scheduler_clone).await
                 {
                     err.report("failed to start watch tasks");
                 }
@@ -113,7 +111,7 @@ where
             pool.spawn(Self::starts_flush_ticks(range_router.clone()));
         }
 
-        info!("the endpoint of stream backup started"; "path" => %config.temp_path);
+        info!("the endpoint of backup stream started"; "path" => %config.temp_path);
         Endpoint {
             config,
             meta_client,
@@ -150,10 +148,8 @@ where
         pd_client: Arc<PDC>,
         concurrency_manager: ConcurrencyManager,
     ) -> Endpoint<EtcdStore, R, E, RT, PDC> {
-        let pool = Arc::new(
-            create_tokio_runtime(config.num_threads, "backup-stream")
-                .expect("failed to create tokio runtime for backup stream worker."),
-        );
+        let pool = create_tokio_runtime(config.num_threads, "backup-stream")
+            .expect("failed to create tokio runtime for backup stream worker.");
 
         // TODO consider TLS?
         let meta_client = match pool.block_on(etcd_client::Client::connect(&endpoints, None)) {
@@ -177,11 +173,10 @@ where
             // spawn a worker to watch task changes from etcd periodically.
             let meta_client_clone = meta_client.clone();
             let scheduler_clone = scheduler.clone();
-            let pool_clone = pool.clone();
             // TODO build a error handle mechanism #error 2
             pool.spawn(async {
                 if let Err(err) =
-                    Self::start_tasks(meta_client_clone, scheduler_clone, pool_clone).await
+                    Self::start_and_watch_tasks(meta_client_clone, scheduler_clone).await
                 {
                     err.report("failed to start watch tasks");
                 }
@@ -227,10 +222,9 @@ where
     }
 
     // TODO find a proper way to exit watch tasks
-    async fn start_tasks(
+    async fn start_and_watch_tasks(
         meta_client: MetadataClient<S>,
         scheduler: Scheduler<Task>,
-        pool: Arc<Runtime>,
     ) -> Result<()> {
         let tasks = meta_client.get_tasks().await?;
         for task in tasks.inner {
@@ -246,7 +240,7 @@ where
         let meta_client_clone = meta_client.clone();
         let scheduler_clone = scheduler.clone();
 
-        pool.spawn(async move {
+        Handle::current().spawn(async move {
             if let Err(err) =
                 Self::starts_watch_task(meta_client_clone, scheduler_clone, revision).await
             {
@@ -254,7 +248,7 @@ where
             }
         });
 
-        pool.spawn(async move {
+        Handle::current().spawn(async move {
             if let Err(err) = Self::starts_watch_pause(meta_client, scheduler, revision).await {
                 err.report("failed to start watch pause");
             }
@@ -407,12 +401,11 @@ where
             .wl()
             .add((start_key.clone(), end_key.clone()));
         if !success {
-            warn!("task ranges overlapped, which hasn't been supported for now";
+            warn!("backup stream task ranges overlapped, which hasn't been supported for now";
                 "task" => ?task,
                 "start_key" => utils::redact(&start_key),
                 "end_key" => utils::redact(&end_key),
             );
-            return Ok(());
         }
 
         tokio::task::spawn_blocking(move || {
@@ -428,13 +421,13 @@ where
             );
             match range_init_result {
                 Ok(stat) => {
-                    info!("success to do initial scanning"; "stat" => ?stat,
+                    info!("backup stream do initial scanning successfully"; "stat" => ?stat,
                         "start_key" => utils::redact(&start_key),
                         "end_key" => utils::redact(&end_key),
                         "take" => ?start.saturating_elapsed(),)
                 }
                 Err(e) => {
-                    e.report("failed to initialize regions");
+                    e.report("backup stream failed to initialize regions");
                 }
             }
         });
@@ -474,7 +467,10 @@ where
                             .register_task(task.clone(), ranges.clone())
                             .await
                         {
-                            err.report(format!("failed to register task {}", task.info.name));
+                            err.report(format!(
+                                "failed to register backup stream task {}",
+                                task.info.name
+                            ));
                             return;
                         }
 
@@ -491,7 +487,7 @@ where
                     }
                     Err(e) => {
                         e.report(format!(
-                            "failed to register task {} to router: ranges not found",
+                            "failed to register backup stream task {} to router: ranges not found",
                             task.info.get_name()
                         ));
                         // TODO build a error handle mechanism #error 5
