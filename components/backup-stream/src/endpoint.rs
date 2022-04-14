@@ -8,15 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use concurrency_manager::ConcurrencyManager;
-use dashmap::DashMap;
+
 use engine_traits::KvEngine;
 
-use futures::executor::block_on;
+
 use kvproto::metapb::Region;
 use pd_client::PdClient;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::fsm::ChangeObserver;
-use resolved_ts::Resolver;
+
 
 use tikv_util::time::Instant;
 

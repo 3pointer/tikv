@@ -38,7 +38,7 @@ use kvproto::{
 use openssl::hash::{Hasher, MessageDigest};
 use protobuf::Message;
 use raftstore::coprocessor::CmdBatch;
-use resolved_ts::Resolver;
+
 use slog_global::debug;
 use tidb_query_datatype::codec::table::decode_table_id;
 

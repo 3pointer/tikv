@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 
-use dashmap::mapref::one::RefMut;
+
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
@@ -11,7 +11,7 @@ use raftstore::{
     router::RaftStoreRouter,
     store::{fsm::ChangeObserver, Callback, SignificantMsg},
 };
-use resolved_ts::Resolver;
+
 use tikv::storage::{
     kv::StatisticsSummary,
     mvcc::{DeltaScanner, ScannerBuilder},
