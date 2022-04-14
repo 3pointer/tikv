@@ -19,6 +19,7 @@ use crate::{
     errors::Error,
     metadata::StreamTask,
     metrics::SKIP_KV_COUNTER,
+    observer::TwoPhaseResolver,
     utils::{self, SegmentMap, Slot, SlotMap, StopWatch},
 };
 
@@ -73,6 +74,7 @@ pub struct ApplyEvent {
 pub struct ApplyEvents {
     events: Vec<ApplyEvent>,
     region_id: u64,
+    // TODO: this field is useless, maybe remove it.
     region_resolved_ts: u64,
 }
 
@@ -81,7 +83,7 @@ impl ApplyEvents {
     /// At the same time, advancing status of the `Resolver` by those keys.
     /// Note: the resolved ts cannot be advanced if there is no command,
     ///       maybe we also need to update resolved_ts when flushing?
-    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut Resolver) -> Self {
+    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut TwoPhaseResolver) -> Self {
         let region_id = cmd.region_id;
         let mut result = vec![];
         for req in cmd
@@ -123,11 +125,11 @@ impl ApplyEvents {
                                 utils::redact(&value)
                             )
                         }) {
-                            Ok(lock) => resolver.track_lock(lock.ts, key, None),
+                            Ok(lock) => resolver.track_lock(lock.ts, key),
                             Err(err) => err.report(format!("region id = {}", region_id)),
                         }
                     }
-                    CmdType::Delete => resolver.untrack_lock(&key, None),
+                    CmdType::Delete => resolver.untrack_lock(&key),
                     _ => {}
                 }
                 continue;

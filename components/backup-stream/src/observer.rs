@@ -1,16 +1,20 @@
+use std::collections::HashSet;
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use std::sync::{Arc, RwLock};
 
 use crate::try_send;
 use crate::utils::SegmentSet;
+use dashmap::mapref::one::RefMut;
 use dashmap::DashMap;
 use engine_traits::KvEngine;
 use kvproto::metapb::Region;
 use raft::StateRole;
 use raftstore::coprocessor::*;
+use resolved_ts::Resolver;
 use tikv_util::worker::Scheduler;
 use tikv_util::{debug, warn};
 use tikv_util::{info, HandyRwLock};
+use txn_types::TimeStamp;
 
 use crate::endpoint::{ObserveOp, Task};
 
@@ -22,7 +26,6 @@ use crate::endpoint::{ObserveOp, Task};
 pub struct BackupStreamObserver {
     scheduler: Scheduler<Task>,
     // Note: maybe wrap those fields to methods?
-    pub subs: SubscriptionTracer,
     pub ranges: Arc<RwLock<SegmentSet<Vec<u8>>>>,
 }
 
@@ -34,7 +37,6 @@ impl BackupStreamObserver {
     pub fn new(scheduler: Scheduler<Task>) -> BackupStreamObserver {
         BackupStreamObserver {
             scheduler,
-            subs: Default::default(),
             ranges: Default::default(),
         }
     }
@@ -86,16 +88,71 @@ impl BackupStreamObserver {
 impl Coprocessor for BackupStreamObserver {}
 
 /// A utility to tracing the regions being subscripted.
-#[derive(Clone, Default)]
-pub struct SubscriptionTracer(Arc<DashMap<u64, ObserveHandle>>);
+#[derive(Clone, Default, Debug)]
+pub struct SubscriptionTracer(Arc<DashMap<u64, RegionSubscription>>);
+
+pub struct RegionSubscription {
+    region_id: u64,
+    handle: ObserveHandle,
+    resolver: TwoPhaseResolver,
+}
+
+impl std::fmt::Debug for RegionSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RegionSubscription")
+            .field(&self.region_id)
+            .field(&self.handle)
+            .finish()
+    }
+}
+
+impl RegionSubscription {
+    pub fn new(region_id: u64, handle: ObserveHandle, start_ts: Option<TimeStamp>) -> Self {
+        Self {
+            handle,
+            region_id,
+            resolver: TwoPhaseResolver::new(region_id, start_ts),
+        }
+    }
+
+    pub fn stop_observing(&self) {
+        self.handle.stop_observing()
+    }
+
+    pub fn is_observing(&self) -> bool {
+        self.handle.is_observing()
+    }
+
+    pub fn resolver(&mut self) -> &mut TwoPhaseResolver {
+        &mut self.resolver
+    }
+}
 
 impl SubscriptionTracer {
-    pub fn register_region(&self, region_id: u64, handle: ObserveHandle) {
+    pub fn register_region(
+        &self,
+        region_id: u64,
+        handle: ObserveHandle,
+        start_ts: Option<TimeStamp>,
+    ) {
         info!("start listen stream from store"; "observer" => ?handle, "region_id" => %region_id);
-        if let Some(o) = self.0.insert(region_id, handle) {
+        if let Some(o) = self.0.insert(
+            region_id,
+            RegionSubscription::new(region_id, handle, start_ts),
+        ) {
             warn!("register region which is already registered"; "region_id" => %region_id);
             o.stop_observing();
         }
+    }
+
+    /// try advance the resolved ts with the min ts of in-memory locks.
+    pub fn resolve_with(&self, min_ts: TimeStamp) -> TimeStamp {
+        self.0
+            .iter_mut()
+            .map(|mut s| s.resolver.resolve(min_ts))
+            .min()
+            // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
+            .unwrap_or(min_ts)
     }
 
     /// try to mark a region no longer be tracked by this observer.
@@ -131,6 +188,87 @@ impl SubscriptionTracer {
             .is_none();
         exists && still_observing
     }
+
+    pub fn get_subscription_of(&self, region_id: u64) -> Option<RefMut<u64, RegionSubscription>> {
+        self.0.get_mut(&region_id)
+    }
+}
+
+/// This enhanced version of `Resolver` allow some unorder of lock events.  
+/// The name "2-phase" means this is used for 2 *concurrency* phases of observing a region:
+/// 1. Doing the initial scanning.
+/// 2. Listening at the incremental data.
+///
+/// ```text
+/// +->(Start TS Of Task)            +->(Task registered to KV)
+/// +--------------------------------+------------------------>
+/// ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^ ^~~~~~~~~~~~~~~~~~~~~~~~~
+/// |                                 +-> Phase 2: Listening incremtnal data.
+/// +-> Phase 1: Initial scanning scans writes between start ts and now.
+/// ```
+///
+/// In backup-stream, we execute these two tasks parallelly. Which may make some race conditions:
+/// - When doing initial scanning, there may be a flush triggered, but the defult resolver
+///   would probably resolved to the tip of incremental events.
+/// - When doing initial scanning, we meet and track a lock already meet by the incremental events,
+///   then the default resolver cannot untrack this lock any more.
+///
+/// This version of resolver did some change for solve these problmes:
+/// - The resolver won't advance the resolved ts to greater than `stable_ts` if there is some. This
+///   can help us prevent resolved ts from advancing when initial scanning hasn't finished yet.
+/// - When we `untrack` a lock haven't been tracked, this would record it, and skip this lock if we want to track it then.
+///   This would be safe because:
+///   - untracking a lock not be tracked is no-op for now.
+///   - tracking a lock have already being untracked (unordered call of `track` and `untrack`) wouldn't happen at phase 2 for same region.
+///     but only when phase 1 and phase 2 happend concurrently, at that time, we wouldn't and cannot advance the resolved ts.
+pub struct TwoPhaseResolver {
+    resolver: Resolver,
+    future_locks: HashSet<Vec<u8>>,
+    stable_ts: Option<TimeStamp>,
+}
+
+impl TwoPhaseResolver {
+    pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
+        if self.future_locks.remove(&key) {
+            return;
+        }
+        self.resolver.track_lock(start_ts, key, None)
+    }
+
+    pub fn untrack_lock(&mut self, key: &[u8]) {
+        if !self.resolver.try_untrack_lock(key, None) {
+            self.future_locks.insert(key.to_owned());
+        }
+    }
+
+    pub fn resolve(&mut self, min_ts: TimeStamp) -> TimeStamp {
+        if let Some(stable_ts) = self.stable_ts {
+            return min_ts.min(stable_ts);
+        }
+
+        self.resolver.resolve(min_ts)
+    }
+
+    pub fn resolved_ts(&self) -> TimeStamp {
+        self.resolver.resolved_ts()
+    }
+
+    pub fn new(region_id: u64, stable_ts: Option<TimeStamp>) -> Self {
+        Self {
+            resolver: Resolver::new(region_id),
+            future_locks: Default::default(),
+            stable_ts,
+        }
+    }
+
+    pub fn phase_one_done(&mut self) {
+        if !self.future_locks.is_empty() {
+            debug!("some future locks not unlocked by the initial scanning, may lock from long long ago."; 
+                "len" => %self.future_locks.len());
+            self.future_locks.clear();
+        }
+        self.stable_ts = None
+    }
 }
 
 impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
@@ -156,12 +294,7 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
         // TODO may be we should filter cmd batch here, to reduce the cost of clone.
         let cmd_batches: Vec<_> = cmd_batches
             .iter()
-            .filter(|cb| {
-                !cb.is_empty()
-                    && cb.level == ObserveLevel::All
-                    // Once the observe has been canceled by outside things, we should be able to stop.
-                    && self.subs.is_observing(cb.region_id)
-            })
+            .filter(|cb| !cb.is_empty() && cb.level == ObserveLevel::All)
             .cloned()
             .collect();
         if cmd_batches.is_empty() {
@@ -203,9 +336,6 @@ impl RegionChangeObserver for BackupStreamObserver {
         event: RegionChangeEvent,
         role: StateRole,
     ) {
-        if !self.subs.is_observing(ctx.region().get_id()) {
-            return;
-        }
         if role != StateRole::Leader {
             try_send!(
                 self.scheduler,
@@ -258,7 +388,7 @@ mod tests {
 
     use crate::endpoint::{ObserveOp, Task};
 
-    use super::BackupStreamObserver;
+    use super::{BackupStreamObserver, SubscriptionTracer};
 
     fn fake_region(id: u64, start: &[u8], end: &[u8]) -> Region {
         let mut r = Region::new();
@@ -269,35 +399,13 @@ mod tests {
     }
 
     #[test]
-    fn test_observer_cancel() {
-        let (sched, mut rx) = dummy_scheduler();
-
-        // Prepare: assuming a task wants the range of [0001, 0010].
-        let o = BackupStreamObserver::new(sched);
-        assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
-
-        // Test regions can be registered.
-        let r = fake_region(42, b"0008", b"0009");
-        o.register_region(&r);
-        let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
-        let handle = ObserveHandle::new();
-        if let Task::ModifyObserve(ObserveOp::Start { region, .. }) = task {
-            o.subs.register_region(region.get_id(), handle.clone())
-        } else {
-            panic!("unexpected message received: it is {}", task);
-        }
-        assert!(o.subs.is_observing(42));
-        handle.stop_observing();
-        assert!(!o.subs.is_observing(42));
-    }
-
-    #[test]
     fn test_observer_basic() {
         let mock_engine = PanicEngine;
         let (sched, mut rx) = dummy_scheduler();
 
         // Prepare: assuming a task wants the range of [0001, 0010].
         let o = BackupStreamObserver::new(sched);
+        let subs = SubscriptionTracer::default();
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
         // Test regions can be registered.
@@ -306,7 +414,7 @@ mod tests {
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
         let handle = ObserveHandle::new();
         if let Task::ModifyObserve(ObserveOp::Start { region, .. }) = task {
-            o.subs.register_region(region.get_id(), handle.clone());
+            subs.register_region(region.get_id(), handle.clone(), None);
         } else {
             panic!("not match, it is {:?}", task);
         }
@@ -338,14 +446,14 @@ mod tests {
         o.on_role_change(&mut ctx, &RoleChange::new(StateRole::Leader));
         let task = rx.recv_timeout(Duration::from_millis(20));
         assert!(task.is_err(), "it is {:?}", task);
-        assert!(!o.subs.is_observing(43));
+        assert!(!subs.is_observing(43));
 
         // Test newly created region out of range won't be added to observe list.
         let mut ctx = ObserverContext::new(&r);
         o.on_region_changed(&mut ctx, RegionChangeEvent::Create, StateRole::Leader);
         let task = rx.recv_timeout(Duration::from_millis(20));
         assert!(task.is_err(), "it is {:?}", task);
-        assert!(!o.subs.is_observing(43));
+        assert!(!subs.is_observing(43));
 
         // Test give up subscripting when become follower.
         let r = fake_region(42, b"0008", b"0009");

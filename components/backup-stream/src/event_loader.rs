@@ -2,6 +2,7 @@
 
 use std::marker::PhantomData;
 
+use dashmap::mapref::one::RefMut;
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
@@ -10,6 +11,7 @@ use raftstore::{
     router::RaftStoreRouter,
     store::{fsm::ChangeObserver, Callback, SignificantMsg},
 };
+use resolved_ts::Resolver;
 use tikv::storage::{
     kv::StatisticsSummary,
     mvcc::{DeltaScanner, ScannerBuilder},
@@ -22,8 +24,9 @@ use txn_types::{Key, TimeStamp};
 use crate::{
     annotate,
     errors::{Error, Result},
+    observer::{SubscriptionTracer, TwoPhaseResolver},
     router::ApplyEvent,
-    utils::RegionPager,
+    utils::{self, RegionPager},
 };
 use crate::{
     metrics,
@@ -66,19 +69,23 @@ impl<S: Snapshot> EventLoader<S> {
         Ok(Self { scanner })
     }
 
-    /// scan a batch of events from the snapshot.
+    /// scan a batch of events from the snapshot. Tracking the locks at the same time.
     /// note: maybe make something like [`EntryBatch`] for reducing allocation.
-    fn scan_batch(&mut self, batch_size: usize, result: &mut ApplyEvents) -> Result<Statistics> {
+    fn scan_batch(
+        &mut self,
+        batch_size: usize,
+        result: &mut ApplyEvents,
+        resolver: &mut TwoPhaseResolver,
+    ) -> Result<Statistics> {
         let mut b = EntryBatch::with_capacity(batch_size);
         self.scanner.scan_entries(&mut b)?;
         for entry in b.drain() {
             match entry {
                 TxnEntry::Prewrite {
                     default: (key, value),
+                    lock: (lock_at, _),
                     ..
                 } => {
-                    // FIXME: we also need to update the information for the `resolver` in the endpoint,
-                    //        otherwise we may advance the resolved ts too far in some conditions?
                     if !key.is_empty() {
                         result.push(ApplyEvent {
                             key,
@@ -87,6 +94,14 @@ impl<S: Snapshot> EventLoader<S> {
                             cmd_type: CmdType::Put,
                         });
                     }
+                    let ts = Key::decode_ts_from(&lock_at).map_err(|err| {
+                        annotate!(
+                            err,
+                            "BUG?: failed to parse ts from lock; key = {}",
+                            utils::redact(&lock_at)
+                        )
+                    })?;
+                    resolver.track_lock(ts, lock_at)
                 }
                 TxnEntry::Commit { default, write, .. } => {
                     result.push(ApplyEvent {
@@ -121,6 +136,7 @@ pub struct InitialDataLoader<E, R, RT> {
     // Note: maybe we can make it an abstract thing like `EventSink` with
     //       method `async (KvEvent) -> Result<()>`?
     sink: Router,
+    tracing: SubscriptionTracer,
 
     _engine: PhantomData<E>,
 }
@@ -131,11 +147,12 @@ where
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E>,
 {
-    pub fn new(router: RT, regions: R, sink: Router) -> Self {
+    pub fn new(router: RT, regions: R, sink: Router, tracing: SubscriptionTracer) -> Self {
         Self {
             router,
             regions,
             sink,
+            tracing,
             _engine: PhantomData,
         }
     }
@@ -198,6 +215,19 @@ where
         Ok(snap)
     }
 
+    pub fn with_resolver<T>(
+        &self,
+        region_id: u64,
+        f: impl FnOnce(&mut TwoPhaseResolver) -> Result<T>,
+    ) -> Result<T> {
+        f(self
+            .tracing
+            .get_subscription_of(region_id)
+            .ok_or_else(|| Error::Other(box_err!("observer for region {} canceled", region_id)))?
+            .value_mut()
+            .resolver())
+    }
+
     pub fn do_initial_scan(
         &self,
         region: &Region,
@@ -209,7 +239,9 @@ where
         let mut stats = StatisticsSummary::default();
         loop {
             let mut events = ApplyEvents::with_capacity(1024, region.id);
-            let stat = event_loader.scan_batch(1024, &mut events)?;
+            let stat = self.with_resolver(region.get_id(), |r| {
+                event_loader.scan_batch(1024, &mut events, r)
+            })?;
             if events.len() == 0 {
                 break;
             }
@@ -223,6 +255,7 @@ where
                 }
             });
         }
+        self.with_resolver(region.get_id(), |r| Ok(r.phase_one_done()))?;
         Ok(stats.stat)
     }
 

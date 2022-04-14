@@ -99,7 +99,12 @@ impl Resolver {
         self.lock_ts_heap.entry(start_ts).or_default().insert(key);
     }
 
+    /// untrack a lock, and ignore whether the lock already be tracked.
     pub fn untrack_lock(&mut self, key: &[u8], index: Option<u64>) {
+        self.try_untrack_lock(key, index);
+    }
+
+    pub fn try_untrack_lock(&mut self, key: &[u8], index: Option<u64>) -> bool {
         if let Some(index) = index {
             self.update_tracked_index(index);
         }
@@ -107,7 +112,7 @@ impl Resolver {
             start_ts
         } else {
             debug!("untrack a lock that was not tracked before"; "key" => &log_wrappers::Value::key(key));
-            return;
+            return false;
         };
         debug!(
             "untrack lock {}@{}, region {}",
@@ -123,6 +128,7 @@ impl Resolver {
                 self.lock_ts_heap.remove(&start_ts);
             }
         }
+        true
     }
 
     /// Try to advance resolved ts.
