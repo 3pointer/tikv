@@ -129,6 +129,10 @@ impl RegionSubscription {
 }
 
 impl SubscriptionTracer {
+    // Register a region as tracing.
+    // The `start_ts` is used to tracking the progress of initial scanning.
+    // (Note: the `None` case of `start_ts` is for testing / refresh region status when split / merge,
+    //    maybe we'd better provide some special API for those cases and remove the `Option`?)
     pub fn register_region(
         &self,
         region_id: u64,
@@ -224,6 +228,8 @@ impl SubscriptionTracer {
 pub struct TwoPhaseResolver {
     resolver: Resolver,
     future_locks: HashSet<Vec<u8>>,
+    /// When `Some`, is the start ts of the initial scanning.
+    /// And implies the phase 1 (initial scanning) is keep running asynchronously.
     stable_ts: Option<TimeStamp>,
 }
 
@@ -236,7 +242,8 @@ impl TwoPhaseResolver {
     }
 
     pub fn untrack_lock(&mut self, key: &[u8]) {
-        if !self.resolver.try_untrack_lock(key, None) {
+        // If we are still in phase one, tracking all unpaired locks.
+        if !self.resolver.try_untrack_lock(key, None) && self.stable_ts.is_some() {
             self.future_locks.insert(key.to_owned());
         }
     }
@@ -250,13 +257,17 @@ impl TwoPhaseResolver {
     }
 
     pub fn resolved_ts(&self) -> TimeStamp {
+        if let Some(stable_ts) = self.stable_ts {
+            return stable_ts;
+        }
+
         self.resolver.resolved_ts()
     }
 
     pub fn new(region_id: u64, stable_ts: Option<TimeStamp>) -> Self {
         Self {
             resolver: Resolver::new(region_id),
-            future_locks: Default::default(),
+            future_locks: HashSet::new(),
             stable_ts,
         }
     }
@@ -396,6 +407,30 @@ mod tests {
         r.set_start_key(start.to_vec());
         r.set_end_key(end.to_vec());
         r
+    }
+
+    #[test]
+    fn test_observer_cancel() {
+        let (sched, mut rx) = dummy_scheduler();
+
+        // Prepare: assuming a task wants the range of [0001, 0010].
+        let o = BackupStreamObserver::new(sched);
+        let subs = SubscriptionTracer::default();
+        assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
+
+        // Test regions can be registered.
+        let r = fake_region(42, b"0008", b"0009");
+        o.register_region(&r);
+        let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
+        let handle = ObserveHandle::new();
+        if let Task::ModifyObserve(ObserveOp::Start { region, .. }) = task {
+            subs.register_region(region.get_id(), handle.clone(), None);
+        } else {
+            panic!("unexpected message received: it is {}", task);
+        }
+        assert!(subs.is_observing(42));
+        handle.stop_observing();
+        assert!(!subs.is_observing(42));
     }
 
     #[test]
