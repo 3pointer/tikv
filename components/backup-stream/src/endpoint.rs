@@ -11,12 +11,10 @@ use concurrency_manager::ConcurrencyManager;
 
 use engine_traits::KvEngine;
 
-
 use kvproto::metapb::Region;
 use pd_client::PdClient;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::fsm::ChangeObserver;
-
 
 use tikv_util::time::Instant;
 

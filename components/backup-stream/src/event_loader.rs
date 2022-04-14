@@ -2,7 +2,6 @@
 
 use std::marker::PhantomData;
 
-
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
@@ -291,8 +290,8 @@ where
             for r in regions {
                 let handle = ObserveHandle::new();
                 let ob = ChangeObserver::from_cdc(r.region.get_id(), handle.clone());
-                let stat = self.initialize_region(&r.region, start_ts, ob)?;
                 on_register_range(r.region.get_id(), handle);
+                let stat = self.initialize_region(&r.region, start_ts, ob)?;
                 total_stat.add_statistics(&stat);
             }
         }
