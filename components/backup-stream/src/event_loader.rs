@@ -277,7 +277,6 @@ where
         start_key: Vec<u8>,
         end_key: Vec<u8>,
         start_ts: TimeStamp,
-        mut on_register_range: impl FnMut(u64, ObserveHandle),
     ) -> Result<Statistics> {
         let mut pager = RegionPager::scan_from(self.regions.clone(), start_key, end_key);
         let mut total_stat = StatisticsSummary::default();
@@ -290,7 +289,8 @@ where
             for r in regions {
                 let handle = ObserveHandle::new();
                 let ob = ChangeObserver::from_cdc(r.region.get_id(), handle.clone());
-                on_register_range(r.region.get_id(), handle);
+                self.tracing
+                    .register_region(&r.region, handle, Some(start_ts));
                 let stat = self.initialize_region(&r.region, start_ts, ob)?;
                 total_stat.add_statistics(&stat);
             }

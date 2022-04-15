@@ -374,14 +374,6 @@ where
                                     start_key.clone(),
                                     end_key.clone(),
                                     TimeStamp::new(start_ts),
-                                    |region_id, handle| {
-                                        // Note: maybe we'd better schedule a "register region" here?
-                                        rs.register_region(
-                                            region_id,
-                                            handle,
-                                            Some(TimeStamp::new(start_ts)),
-                                        );
-                                    },
                                 );
                                 match range_init_result {
                                     Ok(stat) => {
@@ -526,7 +518,7 @@ where
         let handle = ObserveHandle::new();
         let region_id = region.get_id();
         let ob = ChangeObserver::from_cdc(region_id, handle.clone());
-        self.subs.register_region(region_id, handle, None);
+        self.subs.register_region(&region, handle, None);
         init.observe_over(region, ob)?;
         Ok(())
     }
@@ -548,7 +540,7 @@ where
         );
         let region = region.clone();
         self.subs
-            .register_region(region_id, handle, Some(last_checkpoint));
+            .register_region(&region, handle, Some(last_checkpoint));
         // Note: Even we did the initial scanning, if the next_backup_ts was updated by periodic flushing,
         //       before the initial scanning done, there is still possibility of losing data:
         //       if the server crashes immediately, and data of this scanning hasn't been sent to sink,

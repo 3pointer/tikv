@@ -92,7 +92,7 @@ impl Coprocessor for BackupStreamObserver {}
 pub struct SubscriptionTracer(Arc<DashMap<u64, RegionSubscription>>);
 
 pub struct RegionSubscription {
-    region_id: u64,
+    meta: Region,
     handle: ObserveHandle,
     resolver: TwoPhaseResolver,
 }
@@ -100,18 +100,19 @@ pub struct RegionSubscription {
 impl std::fmt::Debug for RegionSubscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("RegionSubscription")
-            .field(&self.region_id)
+            .field(&self.meta.get_id())
             .field(&self.handle)
             .finish()
     }
 }
 
 impl RegionSubscription {
-    pub fn new(region_id: u64, handle: ObserveHandle, start_ts: Option<TimeStamp>) -> Self {
+    pub fn new(region: Region, handle: ObserveHandle, start_ts: Option<TimeStamp>) -> Self {
+        let resolver = TwoPhaseResolver::new(region.get_id(), start_ts);
         Self {
             handle,
-            region_id,
-            resolver: TwoPhaseResolver::new(region_id, start_ts),
+            meta: region,
+            resolver,
         }
     }
 
@@ -135,16 +136,16 @@ impl SubscriptionTracer {
     //    maybe we'd better provide some special API for those cases and remove the `Option`?)
     pub fn register_region(
         &self,
-        region_id: u64,
+        region: &Region,
         handle: ObserveHandle,
         start_ts: Option<TimeStamp>,
     ) {
-        info!("start listen stream from store"; "observer" => ?handle, "region_id" => %region_id);
+        info!("start listen stream from store"; "observer" => ?handle, "region_id" => %region.get_id());
         if let Some(o) = self.0.insert(
-            region_id,
-            RegionSubscription::new(region_id, handle, start_ts),
+            region.get_id(),
+            RegionSubscription::new(region.clone(), handle, start_ts),
         ) {
-            warn!("register region which is already registered"; "region_id" => %region_id);
+            warn!("register region which is already registered"; "region_id" => %region.get_id());
             o.stop_observing();
         }
     }
@@ -423,8 +424,8 @@ mod tests {
         o.register_region(&r);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
         let handle = ObserveHandle::new();
-        if let Task::ModifyObserve(ObserveOp::Start { region, .. }) = task {
-            subs.register_region(region.get_id(), handle.clone(), None);
+        if let Task::ModifyObserve(ObserveOp::Start { ref region, .. }) = task {
+            subs.register_region(region, handle.clone(), None);
         } else {
             panic!("unexpected message received: it is {}", task);
         }
@@ -448,8 +449,8 @@ mod tests {
         o.register_region(&r);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
         let handle = ObserveHandle::new();
-        if let Task::ModifyObserve(ObserveOp::Start { region, .. }) = task {
-            subs.register_region(region.get_id(), handle.clone(), None);
+        if let Task::ModifyObserve(ObserveOp::Start { ref region, .. }) = task {
+            subs.register_region(region, handle.clone(), None);
         } else {
             panic!("not match, it is {:?}", task);
         }
