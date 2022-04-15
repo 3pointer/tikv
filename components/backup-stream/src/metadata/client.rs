@@ -131,7 +131,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
     pub async fn check_task_paused(&self, name: &str) -> Result<bool> {
         let snap = self.meta_store.snapshot().await?;
         let kvs = snap.get(Keys::Key(MetaKey::pause_of(name))).await?;
-        if kvs.is_empty() { Ok(false) } else { Ok(true) }
+        Ok(!kvs.is_empty())
     }
 
     pub async fn get_tasks_pause_status(&self) -> Result<HashMap<Vec<u8>, bool>> {
