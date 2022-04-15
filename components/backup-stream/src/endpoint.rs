@@ -399,7 +399,6 @@ where
             let checkpoint_ts = cli.progress_of_task(task.info.get_name()).await?;
             start_ts = start_ts.max(checkpoint_ts);
         }
-        let rs = self.subs.clone();
         let success = self
             .observer
             .ranges
@@ -411,7 +410,7 @@ where
                 "start_key" => utils::redact(&start_key),
                 "end_key" => utils::redact(&end_key),
             );
-            continue;
+            return Ok(());
         }
         tokio::task::spawn_blocking(move || {
             let range_init_result =
