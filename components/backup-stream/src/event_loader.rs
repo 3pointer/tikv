@@ -22,7 +22,7 @@ use txn_types::{Key, TimeStamp};
 
 use crate::{
     annotate,
-    errors::{Error, Result},
+    errors::{ContextualResultExt, Error, Result},
     observer::{SubscriptionTracer, TwoPhaseResolver},
     router::ApplyEvent,
     utils::{self, RegionPager},
@@ -55,15 +55,11 @@ impl<S: Snapshot> EventLoader<S> {
             .hint_min_ts(Some(from_ts))
             .fill_cache(false)
             .build_delta_scanner(from_ts, ExtraOp::Noop)
-            .map_err(|err| {
-                annotate!(
-                    err,
-                    "failed to create entry scanner from_ts = {}, to_ts = {}, region = {}",
-                    from_ts,
-                    to_ts,
-                    region_id
-                )
-            })?;
+            .map_err(|err| Error::Txn(err.into()))
+            .context(format_args!(
+                "failed to create entry scanner from_ts = {}, to_ts = {}, region = {}",
+                from_ts, to_ts, region_id
+            ))?;
 
         Ok(Self { scanner })
     }
@@ -167,9 +163,8 @@ where
         // Registering the observer to the raftstore is necessary because we should only listen events from leader.
         // In CDC, the change observer is per-delegate(i.e. per-region), we can create the command per-region here too.
 
-        let (callback, fut) = tikv_util::future::paired_future_callback::<
-            std::result::Result<_, Box<dyn std::error::Error + Send + Sync>>,
-        >();
+        let (callback, fut) =
+            tikv_util::future::paired_future_callback::<std::result::Result<_, Error>>();
         self.router
             .significant_send(
                 region.id,
@@ -178,9 +173,8 @@ where
                     region_epoch: region.get_region_epoch().clone(),
                     callback: Callback::Read(Box::new(|snapshot| {
                         if snapshot.response.get_header().has_error() {
-                            callback(Err(box_err!(
-                                "failed to get snapshot: {:?}",
-                                snapshot.response.get_header().get_error()
+                            callback(Err(Error::RaftStore(
+                                snapshot.response.get_header().get_error().clone(),
                             )));
                             return;
                         }
@@ -188,28 +182,23 @@ where
                             callback(Ok(snap));
                             return;
                         }
-                        callback(Err(box_err!(
+                        callback(Err(Error::Other(box_err!(
                             "PROBABLY BUG: the response contains neither error nor snapshot"
-                        )))
+                        ))))
                     })),
                 },
             )
-            .map_err(|err| {
-                annotate!(
-                    err,
-                    "failed to register the observer to region {}",
-                    region.get_id()
-                )
-            })?;
+            .map_err(|err| Error::Other(Box::new(err)))
+            .context(format_args!(
+                "failed to register the observer to region {}",
+                region.get_id()
+            ))?;
         let snap = block_on(fut)
             .expect("BUG: channel of paired_future_callback canceled.")
-            .map_err(|err| {
-                annotate!(
-                    err,
-                    "failed to get initial snapshot: failed to get the snapshot (region_id = {})",
-                    region.get_id()
-                )
-            })?;
+            .context(format_args!(
+                "failed to get initial snapshot: failed to get the snapshot (region_id = {})",
+                region.get_id(),
+            ))?;
         // Note: maybe warp the snapshot via `RegionSnapshot`?
         Ok(snap)
     }

@@ -19,6 +19,7 @@ use raftstore::store::fsm::ChangeObserver;
 use tikv_util::time::Instant;
 
 use tokio::io::Result as TokioResult;
+use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 use tokio_stream::StreamExt;
 use txn_types::TimeStamp;
@@ -100,7 +101,8 @@ where
             let scheduler_clone = scheduler.clone();
             // TODO build a error handle mechanism #error 2
             pool.spawn(async {
-                if let Err(err) = Self::starts_watch_tasks(meta_client_clone, scheduler_clone).await
+                if let Err(err) =
+                    Self::start_and_watch_tasks(meta_client_clone, scheduler_clone).await
                 {
                     err.report("failed to start watch tasks");
                 }
@@ -108,7 +110,7 @@ where
             pool.spawn(Self::starts_flush_ticks(range_router.clone()));
         }
 
-        info!("the endpoint of stream backup started"; "path" => %config.temp_path);
+        info!("the endpoint of backup stream started"; "path" => %config.temp_path);
         Endpoint {
             config,
             meta_client,
@@ -172,11 +174,13 @@ where
             let scheduler_clone = scheduler.clone();
             // TODO build a error handle mechanism #error 2
             pool.spawn(async {
-                if let Err(err) = Self::starts_watch_tasks(meta_client_clone, scheduler_clone).await
+                if let Err(err) =
+                    Self::start_and_watch_tasks(meta_client_clone, scheduler_clone).await
                 {
                     err.report("failed to start watch tasks");
                 }
             });
+
             pool.spawn(Self::starts_flush_ticks(range_router.clone()));
         }
 
@@ -207,6 +211,12 @@ where
     RT: RaftStoreRouter<E> + 'static,
     PDC: PdClient + 'static,
 {
+    fn on_fatal_error(&self, _task: String, _err: Box<Error>) {
+        // This is a stub.
+        // TODO: implement the feature of reporting fatal error to the meta storage,
+        //       and pause the task then.
+    }
+
     async fn starts_flush_ticks(router: Router) {
         loop {
             // wait 1min to trigger tick
@@ -217,30 +227,83 @@ where
     }
 
     // TODO find a proper way to exit watch tasks
-    async fn starts_watch_tasks(
+    async fn start_and_watch_tasks(
         meta_client: MetadataClient<S>,
         scheduler: Scheduler<Task>,
     ) -> Result<()> {
         let tasks = meta_client.get_tasks().await?;
         for task in tasks.inner {
             info!("backup stream watch task"; "task" => ?task);
+            if task.is_paused {
+                continue;
+            }
             // move task to schedule
             scheduler.schedule(Task::WatchTask(TaskOp::AddTask(task)))?;
         }
 
-        let mut watcher = meta_client.events_from(tasks.revision).await?;
+        let revision = tasks.revision;
+        let meta_client_clone = meta_client.clone();
+        let scheduler_clone = scheduler.clone();
+
+        Handle::current().spawn(async move {
+            if let Err(err) =
+                Self::starts_watch_task(meta_client_clone, scheduler_clone, revision).await
+            {
+                err.report("failed to start watch tasks");
+            }
+        });
+
+        Handle::current().spawn(async move {
+            if let Err(err) = Self::starts_watch_pause(meta_client, scheduler, revision).await {
+                err.report("failed to start watch pause");
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn starts_watch_task(
+        meta_client: MetadataClient<S>,
+        scheduler: Scheduler<Task>,
+        revision: i64,
+    ) -> Result<()> {
+        let mut watcher = meta_client.events_from(revision).await?;
         loop {
             if let Some(event) = watcher.stream.next().await {
                 info!("backup stream watch event from etcd"; "event" => ?event);
                 match event {
                     MetadataEvent::AddTask { task } => {
-                        let t = meta_client.get_task(&task).await?;
-                        scheduler.schedule(Task::WatchTask(TaskOp::AddTask(t)))?;
+                        scheduler.schedule(Task::WatchTask(TaskOp::AddTask(task)))?;
                     }
                     MetadataEvent::RemoveTask { task } => {
                         scheduler.schedule(Task::WatchTask(TaskOp::RemoveTask(task)))?;
                     }
                     MetadataEvent::Error { err } => err.report("metadata client watch meet error"),
+                    _ => panic!("BUG: invalid event {:?}", event),
+                }
+            }
+        }
+    }
+
+    async fn starts_watch_pause(
+        meta_client: MetadataClient<S>,
+        scheduler: Scheduler<Task>,
+        revision: i64,
+    ) -> Result<()> {
+        let mut watcher = meta_client.events_from_pause(revision).await?;
+        loop {
+            if let Some(event) = watcher.stream.next().await {
+                info!("backup stream watch event from etcd"; "event" => ?event);
+                match event {
+                    MetadataEvent::PauseTask { task } => {
+                        scheduler.schedule(Task::WatchTask(TaskOp::PauseTask(task)))?;
+                    }
+                    MetadataEvent::ResumeTask { task } => {
+                        let task = meta_client.get_task(&task).await?;
+                        scheduler.schedule(Task::WatchTask(TaskOp::ResumeTask(task)))?;
+                    }
+                    MetadataEvent::Error { err } => err.report("metadata client watch meet error"),
+                    _ => panic!("BUG: invalid event {:?}", event),
                 }
             }
         }
@@ -311,7 +374,61 @@ where
             TaskOp::RemoveTask(task_name) => {
                 self.on_unregister(&task_name);
             }
+            TaskOp::PauseTask(task_name) => {
+                self.on_unregister(&task_name);
+            }
+            TaskOp::ResumeTask(task) => {
+                self.on_register(task);
+            }
         }
+    }
+
+    async fn observe_and_scan_region(
+        &self,
+        init: InitialDataLoader<E, R, RT>,
+        task: &StreamTask,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+    ) -> Result<()> {
+        let start_key = start_key;
+        let end_key = end_key;
+        let start = Instant::now_coarse();
+        let mut start_ts = task.info.get_start_ts();
+        // Should scan from checkpoint_ts rather than start_ts if checkpoint_ts exists in Metadata.
+        if let Some(cli) = &self.meta_client {
+            let checkpoint_ts = cli.progress_of_task(task.info.get_name()).await?;
+            start_ts = start_ts.max(checkpoint_ts);
+        }
+        let rs = self.subs.clone();
+        let success = self
+            .observer
+            .ranges
+            .wl()
+            .add((start_key.clone(), end_key.clone()));
+        if !success {
+            warn!("task ranges overlapped, which hasn't been supported for now";
+                "task" => ?task,
+                "start_key" => utils::redact(&start_key),
+                "end_key" => utils::redact(&end_key),
+            );
+            continue;
+        }
+        tokio::task::spawn_blocking(move || {
+            let range_init_result =
+                init.initialize_range(start_key.clone(), end_key.clone(), TimeStamp::new(start_ts));
+            match range_init_result {
+                Ok(stat) => {
+                    info!("success to do initial scanning"; "stat" => ?stat,
+                        "start_key" => utils::redact(&start_key),
+                        "end_key" => utils::redact(&end_key),
+                        "take" => ?start.saturating_elapsed(),)
+                }
+                Err(e) => {
+                    e.report("failed to initialize regions");
+                }
+            }
+        });
+        Ok(())
     }
 
     // register task ranges
@@ -346,47 +463,19 @@ where
                             .register_task(task.clone(), ranges.clone())
                             .await
                         {
-                            err.report(format!("failed to register task {}", task.info.name));
+                            err.report(format!(
+                                "failed to register backup stream task {}",
+                                task.info.name
+                            ));
                             return;
                         }
+
                         for (start_key, end_key) in ranges {
                             let init = init.clone();
-                            let start_key = start_key;
-                            let end_key = end_key;
-                            let start = Instant::now_coarse();
-                            let start_ts = task.info.get_start_ts();
-                            let rs = self.subs.clone();
-                            let success = self
-                                .observer
-                                .ranges
-                                .wl()
-                                .add((start_key.clone(), end_key.clone()));
-                            if !success {
-                                warn!("task ranges overlapped, which hasn't been supported for now";
-                                    "task" => ?task,
-                                    "start_key" => utils::redact(&start_key),
-                                    "end_key" => utils::redact(&end_key),
-                                );
-                                continue;
-                            }
-                            tokio::task::spawn_blocking(move || {
-                                let range_init_result = init.initialize_range(
-                                    start_key.clone(),
-                                    end_key.clone(),
-                                    TimeStamp::new(start_ts),
-                                );
-                                match range_init_result {
-                                    Ok(stat) => {
-                                        info!("success to do initial scanning"; "stat" => ?stat,
-                                            "start_key" => utils::redact(&start_key),
-                                            "end_key" => utils::redact(&end_key),
-                                            "take" => ?start.saturating_elapsed(),)
-                                    }
-                                    Err(e) => {
-                                        e.report("failed to initialize regions");
-                                    }
-                                }
-                            });
+
+                            self.observe_and_scan_region(init, &task, start_key, end_key)
+                                .await
+                                .unwrap();
                         }
                         info!(
                             "finish register backup stream ranges";
@@ -395,7 +484,7 @@ where
                     }
                     Err(e) => {
                         e.report(format!(
-                            "failed to register task {} to router: ranges not found",
+                            "failed to register backup stream task {} to router: ranges not found",
                             task.info.get_name()
                         ));
                         // TODO build a error handle mechanism #error 5
@@ -644,12 +733,16 @@ pub enum Task {
     ModifyObserve(ObserveOp),
     /// Convert status of some task into `flushing` and do flush then.
     ForceFlush(String),
+    /// FatalError pauses the task and set the error.
+    FatalError(String, Box<Error>),
 }
 
 #[derive(Debug)]
 pub enum TaskOp {
     AddTask(StreamTask),
     RemoveTask(String),
+    PauseTask(String),
+    ResumeTask(StreamTask),
 }
 
 #[derive(Debug)]
@@ -681,6 +774,9 @@ impl fmt::Debug for Task {
             Self::Flush(arg0) => f.debug_tuple("Flush").field(arg0).finish(),
             Self::ModifyObserve(op) => f.debug_tuple("ModifyObserve").field(op).finish(),
             Self::ForceFlush(arg0) => f.debug_tuple("ForceFlush").field(arg0).finish(),
+            Self::FatalError(task, err) => {
+                f.debug_tuple("FatalError").field(task).field(err).finish()
+            }
         }
     }
 }
@@ -709,6 +805,7 @@ where
             Task::Flush(task) => self.on_flush(task, self.store_id),
             Task::ModifyObserve(op) => self.on_modify_observe(op),
             Task::ForceFlush(task) => self.on_force_flush(task, self.store_id),
+            Task::FatalError(task, err) => self.on_fatal_error(task, err),
             _ => (),
         }
     }
