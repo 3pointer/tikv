@@ -92,7 +92,7 @@ impl Coprocessor for BackupStreamObserver {}
 pub struct SubscriptionTracer(Arc<DashMap<u64, RegionSubscription>>);
 
 pub struct RegionSubscription {
-    meta: Region,
+    pub meta: Region,
     handle: ObserveHandle,
     resolver: TwoPhaseResolver,
 }
@@ -162,8 +162,20 @@ impl SubscriptionTracer {
 
     /// try to mark a region no longer be tracked by this observer.
     /// returns whether success (it failed if the region hasn't been observed when calling this.)
-    pub fn deregister_region(&self, region_id: u64) -> bool {
-        match self.0.remove(&region_id) {
+    pub fn deregister_region(&self, region: &Region) -> bool {
+        let region_id = region.get_id();
+        let remove_result = self.0.remove_if(&region_id, |_, old_region| {
+            raftstore::store::util::compare_region_epoch(
+                old_region.meta.get_region_epoch(),
+                region,
+                true,
+                true,
+                false,
+            )
+            .map_err(|err| warn!("remove failed because epoch not match"; "err" => %err))
+            .is_ok()
+        });
+        match remove_result {
             Some(o) => {
                 o.1.stop_observing();
                 info!("stop listen stream from store"; "observer" => ?o.1, "region_id"=> %region_id);
@@ -174,6 +186,48 @@ impl SubscriptionTracer {
                 false
             }
         }
+    }
+
+    /// try update the subscription status by the new region info.
+    ///
+    /// # return
+    ///
+    /// If the status can be updated internally without deregister-and-register, returns false.
+    pub fn try_update_region(&self, new_region: &Region) -> bool {
+        let mut sub = match self.get_subscription_of(new_region.get_id()) {
+            Some(sub) => sub,
+            None => {
+                warn!("backup stream observer refreshing void subscription."; "new_region" => ?new_region);
+                return true;
+            }
+        };
+
+        let mut subscription = sub.value_mut();
+
+        let old_epoch = subscription.meta.get_region_epoch();
+        let new_epoch = new_region.get_region_epoch();
+        if old_epoch.version == new_epoch.version {
+            subscription.meta = new_region.clone();
+            return true;
+        }
+
+        if new_region.get_start_key() >= subscription.meta.get_start_key()
+            && new_region.get_end_key() <= subscription.meta.get_end_key()
+        {
+            // maybe region split, let's destory the locks in the range.
+            subscription.resolver.resolver.destroy_lock_range(
+                subscription.meta.get_start_key(),
+                new_region.get_start_key(),
+            );
+            subscription
+                .resolver
+                .resolver
+                .destroy_lock_range(new_region.get_end_key(), subscription.meta.get_end_key());
+            subscription.meta = new_region.clone();
+            return true;
+        }
+
+        false
     }
 
     /// check whether the region_id should be observed by this observer.

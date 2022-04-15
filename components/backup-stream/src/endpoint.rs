@@ -677,18 +677,29 @@ where
                     ));
                 }
             }
-            ObserveOp::Stop { region } => {
-                self.subs.deregister_region(region.id);
+            ObserveOp::Stop { ref region } => {
+                self.subs.deregister_region(region);
             }
-            ObserveOp::RefreshResolver { region } => {
-                let canceled = self.subs.deregister_region(region.id);
+            ObserveOp::RefreshResolver { ref region } => {
+                let need_refresh_all = self.subs.try_update_region(&region);
 
-                if canceled {
-                    if let Err(e) = self.observe_over(&region) {
-                        e.report(format!(
-                            "register region {} to raftstore when refreshing",
-                            region.get_id()
-                        ));
+                if need_refresh_all {
+                    let canceled = self.subs.deregister_region(region);
+                    if canceled {
+                        let for_task = self.find_task_by_region(&region).unwrap_or_else(|| {
+                            panic!(
+                                "BUG: the region {:?} is register to no task but being observed",
+                                region
+                            )
+                        });
+                        if let Err(e) =
+                            self.observe_over_with_initial_data_from_checkpoint(&region, for_task)
+                        {
+                            e.report(format!(
+                                "register region {} to raftstore when refreshing",
+                                region.get_id()
+                            ));
+                        }
                     }
                 }
             }
