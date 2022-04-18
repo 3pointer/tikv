@@ -1,9 +1,9 @@
-use std::collections::HashSet;
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use std::sync::{Arc, RwLock};
 
-use crate::try_send;
+use crate::debug;
 use crate::utils::SegmentSet;
+use crate::{try_send, utils};
 use dashmap::mapref::one::RefMut;
 use dashmap::DashMap;
 use engine_traits::KvEngine;
@@ -12,8 +12,7 @@ use raft::StateRole;
 use raftstore::coprocessor::*;
 use resolved_ts::Resolver;
 use tikv_util::worker::Scheduler;
-use tikv_util::{debug, warn};
-use tikv_util::{info, HandyRwLock};
+use tikv_util::{info, warn, HandyRwLock};
 use txn_types::TimeStamp;
 
 use crate::endpoint::{ObserveOp, Task};
@@ -160,20 +159,32 @@ impl SubscriptionTracer {
             .unwrap_or(min_ts)
     }
 
+    pub fn warn_if_gap_too_huge(&self, ts: TimeStamp) {
+        if TimeStamp::physical_now() - ts.physical() >= 10 * 60 * 1000
+        /* 10 mins */
+        {
+            let far_resolver = self
+                .0
+                .iter()
+                .min_by_key(|r| r.value().resolver.resolved_ts());
+            warn!("stream backup resolver ts advancing too slow";
+            "far_resolver" => %{match far_resolver {
+                Some(r) => format!("{:?}", r.value().resolver),
+                None => "BUG[NoResolverButResolvedTSDoesNotAdvance]".to_owned()
+            }});
+        }
+    }
+
     /// try to mark a region no longer be tracked by this observer.
     /// returns whether success (it failed if the region hasn't been observed when calling this.)
-    pub fn deregister_region(&self, region: &Region) -> bool {
+    pub fn deregister_region(
+        &self,
+        region: &Region,
+        if_cond: impl FnOnce(&Region, &Region) -> bool,
+    ) -> bool {
         let region_id = region.get_id();
         let remove_result = self.0.remove_if(&region_id, |_, old_region| {
-            raftstore::store::util::compare_region_epoch(
-                old_region.meta.get_region_epoch(),
-                region,
-                true,
-                true,
-                false,
-            )
-            .map_err(|err| warn!("remove failed because epoch not match"; "err" => %err))
-            .is_ok()
+            if_cond(&old_region.meta, region)
         });
         match remove_result {
             Some(o) => {
@@ -207,22 +218,6 @@ impl SubscriptionTracer {
         let old_epoch = subscription.meta.get_region_epoch();
         let new_epoch = new_region.get_region_epoch();
         if old_epoch.version == new_epoch.version {
-            subscription.meta = new_region.clone();
-            return true;
-        }
-
-        if new_region.get_start_key() >= subscription.meta.get_start_key()
-            && new_region.get_end_key() <= subscription.meta.get_end_key()
-        {
-            // maybe region split, let's destory the locks in the range.
-            subscription.resolver.resolver.destroy_lock_range(
-                subscription.meta.get_start_key(),
-                new_region.get_start_key(),
-            );
-            subscription
-                .resolver
-                .resolver
-                .destroy_lock_range(new_region.get_end_key(), subscription.meta.get_end_key());
             subscription.meta = new_region.clone();
             return true;
         }
@@ -282,15 +277,48 @@ impl SubscriptionTracer {
 ///     but only when phase 1 and phase 2 happend concurrently, at that time, we wouldn't and cannot advance the resolved ts.
 pub struct TwoPhaseResolver {
     resolver: Resolver,
-    future_locks: HashSet<Vec<u8>>,
+    future_locks: Vec<FutureLock>,
     /// When `Some`, is the start ts of the initial scanning.
     /// And implies the phase 1 (initial scanning) is keep running asynchronously.
     stable_ts: Option<TimeStamp>,
 }
 
+enum FutureLock {
+    Lock(Vec<u8>, TimeStamp),
+    Unlock(Vec<u8>),
+}
+
+impl std::fmt::Debug for FutureLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(arg0, arg1) => f
+                .debug_tuple("Lock")
+                .field(&format_args!("{}", utils::redact(arg0)))
+                .field(arg1)
+                .finish(),
+            Self::Unlock(arg0) => f
+                .debug_tuple("Unlock")
+                .field(&format_args!("{}", utils::redact(arg0)))
+                .finish(),
+        }
+    }
+}
+
 impl TwoPhaseResolver {
+    pub fn in_phase_one(&self) -> bool {
+        self.stable_ts.is_some()
+    }
+
+    pub fn track_phase_one_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
+        if !self.in_phase_one() {
+            warn!("backup stream tracking lock as if in phase one"; "start_ts" => %start_ts, "key" => %utils::redact(&key))
+        }
+        self.resolver.track_lock(start_ts, key, None)
+    }
+
     pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
-        if self.future_locks.remove(&key) {
+        if self.in_phase_one() {
+            self.future_locks.push(FutureLock::Lock(key, start_ts));
             return;
         }
         self.resolver.track_lock(start_ts, key, None)
@@ -298,8 +326,17 @@ impl TwoPhaseResolver {
 
     pub fn untrack_lock(&mut self, key: &[u8]) {
         // If we are still in phase one, tracking all unpaired locks.
-        if !self.resolver.try_untrack_lock(key, None) && self.stable_ts.is_some() {
-            self.future_locks.insert(key.to_owned());
+        if self.in_phase_one() {
+            self.future_locks.push(FutureLock::Unlock(key.to_owned()));
+            return;
+        }
+        self.resolver.untrack_lock(key, None)
+    }
+
+    fn handle_future_lock(&mut self, lock: FutureLock) {
+        match lock {
+            FutureLock::Lock(key, ts) => self.resolver.track_lock(ts, key, None),
+            FutureLock::Unlock(key) => self.resolver.untrack_lock(&key, None),
         }
     }
 
@@ -322,18 +359,26 @@ impl TwoPhaseResolver {
     pub fn new(region_id: u64, stable_ts: Option<TimeStamp>) -> Self {
         Self {
             resolver: Resolver::new(region_id),
-            future_locks: HashSet::new(),
+            future_locks: Default::default(),
             stable_ts,
         }
     }
 
     pub fn phase_one_done(&mut self) {
-        if !self.future_locks.is_empty() {
-            debug!("some future locks not unlocked by the initial scanning, may lock from long long ago."; 
-                "len" => %self.future_locks.len());
-            self.future_locks.clear();
+        debug!("phase one done"; "resolver" => ?self.resolver, "future_locks" => ?self.future_locks);
+        for lock in std::mem::take(&mut self.future_locks).into_iter() {
+            self.handle_future_lock(lock);
         }
         self.stable_ts = None
+    }
+}
+
+impl std::fmt::Debug for TwoPhaseResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TwoPhaseResolver")
+            .field(&self.stable_ts)
+            .field(&self.resolver)
+            .finish()
     }
 }
 
@@ -403,19 +448,13 @@ impl RegionChangeObserver for BackupStreamObserver {
         role: StateRole,
     ) {
         if role != StateRole::Leader {
-            try_send!(
-                self.scheduler,
-                Task::ModifyObserve(ObserveOp::Stop {
-                    region: ctx.region().clone(),
-                })
-            );
             return;
         }
         match event {
             RegionChangeEvent::Destroy => {
                 try_send!(
                     self.scheduler,
-                    Task::ModifyObserve(ObserveOp::Stop {
+                    Task::ModifyObserve(ObserveOp::CheckEpochAndStop {
                         region: ctx.region().clone(),
                     })
                 );

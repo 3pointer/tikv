@@ -438,9 +438,9 @@ mod test {
 
         run_async_test(async {
             // write data before the task starting, for testing incremental scanning.
-            let round1 = suite.write_records(0, 128, 1).await;
+            let round1 = suite.write_records(0, 1280, 1).await;
             suite.must_register_task(1, "test_basic");
-            let round2 = suite.write_records(256, 128, 1).await;
+            let round2 = suite.write_records(2560, 1280, 1).await;
             suite.force_flush_files("test_basic");
             std::thread::sleep(Duration::from_secs(4));
             suite.check_for_write_records(
@@ -476,10 +476,10 @@ mod test {
         test_util::init_log_for_test();
         let mut suite = super::Suite::new("leader_down", 4);
         suite.must_register_task(1, "test_leader_down");
-        let round1 = run_async_test(suite.write_records(0, 128, 1));
+        let round1 = run_async_test(suite.write_records(0, 1280, 1));
         let leader = suite.cluster.leader_of_region(1).unwrap().get_store_id();
         suite.cluster.stop_node(leader);
-        let round2 = run_async_test(suite.write_records(256, 128, 1));
+        let round2 = run_async_test(suite.write_records(2560, 1280, 1));
         suite.force_flush_files("test_leader_down");
         std::thread::sleep(Duration::from_secs(4));
         suite.check_for_write_records(

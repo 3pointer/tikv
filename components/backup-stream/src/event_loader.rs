@@ -2,6 +2,7 @@
 
 use std::marker::PhantomData;
 
+use crossbeam::sync::WaitGroup;
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
@@ -18,10 +19,10 @@ use tikv::storage::{
     Snapshot, Statistics,
 };
 use tikv_util::{box_err, info, warn};
-use txn_types::{Key, TimeStamp};
+use txn_types::{Key, Lock, TimeStamp};
 
 use crate::{
-    annotate,
+    annotate, debug,
     errors::{ContextualResultExt, Error, Result},
     observer::{SubscriptionTracer, TwoPhaseResolver},
     router::ApplyEvent,
@@ -78,7 +79,7 @@ impl<S: Snapshot> EventLoader<S> {
             match entry {
                 TxnEntry::Prewrite {
                     default: (key, value),
-                    lock: (lock_at, _),
+                    lock: (lock_at, lock_value),
                     ..
                 } => {
                     if !key.is_empty() {
@@ -89,14 +90,15 @@ impl<S: Snapshot> EventLoader<S> {
                             cmd_type: CmdType::Put,
                         });
                     }
-                    let ts = Key::decode_ts_from(&lock_at).map_err(|err| {
+                    let lock = Lock::parse(&lock_value).map_err(|err| {
                         annotate!(
                             err,
                             "BUG?: failed to parse ts from lock; key = {}",
                             utils::redact(&lock_at)
                         )
                     })?;
-                    resolver.track_lock(ts, lock_at)
+                    debug!("meet lock during initial scanning."; "key" => %utils::redact(&lock_at), "ts" => %lock.ts);
+                    resolver.track_phase_one_lock(lock.ts, lock_at)
                 }
                 TxnEntry::Commit { default, write, .. } => {
                     result.push(ApplyEvent {
@@ -203,17 +205,50 @@ where
         Ok(snap)
     }
 
-    pub fn with_resolver<T>(
+    pub fn with_resolver<T: 'static>(
         &self,
         region_id: u64,
         f: impl FnOnce(&mut TwoPhaseResolver) -> Result<T>,
     ) -> Result<T> {
-        f(self
-            .tracing
+        Self::with_resolver_by(&self.tracing, region_id, f)
+    }
+
+    pub fn with_resolver_by<T: 'static>(
+        tracing: &SubscriptionTracer,
+        region_id: u64,
+        f: impl FnOnce(&mut TwoPhaseResolver) -> Result<T>,
+    ) -> Result<T> {
+        f(tracing
             .get_subscription_of(region_id)
             .ok_or_else(|| Error::Other(box_err!("observer for region {} canceled", region_id)))?
             .value_mut()
             .resolver())
+    }
+
+    fn scan_and_async_send(
+        &self,
+        region: &Region,
+        mut event_loader: EventLoader<impl Snapshot>,
+        join_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    ) -> Result<Statistics> {
+        let mut stats = StatisticsSummary::default();
+        loop {
+            let mut events = ApplyEvents::with_capacity(1024, region.id);
+            let stat = self.with_resolver(region.get_id(), |r| {
+                event_loader.scan_batch(1024, &mut events, r)
+            })?;
+            if events.len() == 0 {
+                return Ok(stats.stat);
+            }
+            stats.add_statistics(&stat);
+            let sink = self.sink.clone();
+            metrics::INCREMENTAL_SCAN_SIZE.observe(events.size() as f64);
+            join_handles.push(tokio::spawn(async move {
+                if let Err(err) = sink.on_events(events).await {
+                    warn!("failed to send event to sink"; "err" => %err);
+                }
+            }));
+        }
     }
 
     pub fn do_initial_scan(
@@ -223,28 +258,30 @@ where
         snap: impl Snapshot,
     ) -> Result<Statistics> {
         // It is ok to sink more data than needed. So scan to +inf TS for convenance.
-        let mut event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
-        let mut stats = StatisticsSummary::default();
-        loop {
-            let mut events = ApplyEvents::with_capacity(1024, region.id);
-            let stat = self.with_resolver(region.get_id(), |r| {
-                event_loader.scan_batch(1024, &mut events, r)
-            })?;
-            if events.len() == 0 {
-                break;
-            }
-            stats.add_statistics(&stat);
-            let sink = self.sink.clone();
-            // Note: maybe we'd better don't spawn it to another thread for preventing OOM?
-            tokio::spawn(async move {
-                metrics::INCREMENTAL_SCAN_SIZE.observe(events.size() as f64);
-                if let Err(err) = sink.on_events(events).await {
-                    warn!("failed to send event to sink"; "err" => %err);
+        let event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
+        let tr = self.tracing.clone();
+        let region_id = region.get_id();
+
+        let mut join_handles = Vec::with_capacity(8);
+        let stats = self.scan_and_async_send(region, event_loader, &mut join_handles);
+
+        // we should mark phase one as finished whether scan successed.
+        // TODO: use an `WaitGroup` with asynchronous support.
+        tokio::spawn(async move {
+            for h in join_handles {
+                if let Err(err) = tokio::join!(h).0 {
+                    warn!("failed to join task."; "err" => %err);
                 }
-            });
-        }
-        self.with_resolver(region.get_id(), |r| Ok(r.phase_one_done()))?;
-        Ok(stats.stat)
+            }
+            if let Err(err) = Self::with_resolver_by(&tr, region_id, |r| Ok(r.phase_one_done())) {
+                err.report(format_args!(
+                    "failed to finish phase 1 for region {:?}",
+                    region_id
+                ));
+            }
+            debug!("phase one done."; "region_id" => %region_id);
+        });
+        stats
     }
 
     /// Initialize the region: register it to the raftstore and the observer.
@@ -271,7 +308,7 @@ where
         let mut total_stat = StatisticsSummary::default();
         loop {
             let regions = pager.next_page(8)?;
-            info!("scanning for entries in region."; "regions" => ?regions);
+            debug!("scanning for entries in region."; "regions" => ?regions);
             if regions.is_empty() {
                 break;
             }

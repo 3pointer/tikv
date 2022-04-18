@@ -514,8 +514,9 @@ where
             .unwrap_or_default();
         let min_ts = cm.global_min_lock_ts().unwrap_or(TimeStamp::max());
         let tso = Ord::min(pd_tso, min_ts);
-        info!("backup stream using tso for resolving"; "min_ts" => %min_ts, "pd_tso" => %pd_tso);
-        resolvers.resolve_with(tso)
+        let ts = resolvers.resolve_with(tso);
+        resolvers.warn_if_gap_too_huge(ts);
+        ts
     }
 
     async fn flush_for_task(
@@ -535,7 +536,10 @@ where
             .with_label_values(&["resolve_by_now"])
             .observe(start.saturating_elapsed_secs());
         if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
-            info!("flushing and refreshing checkpoint ts."; "checkpoint_ts" => %rts, "task" => %task);
+            info!("flushing and refreshing checkpoint ts.";
+                "checkpoint_ts" => %rts,
+                "task" => %task,
+            );
             if rts == 0 {
                 // We cannot advance the resolved ts for now.
                 return;
@@ -617,18 +621,21 @@ where
         task: String,
     ) -> Result<()> {
         let init = self.make_initial_loader();
+
         let handle = ObserveHandle::new();
-        let region_id = region.get_id();
-        let ob = ChangeObserver::from_cdc(region_id, handle.clone());
-        let snap = init.observe_over(region, ob)?;
         let meta_cli = self.meta_client.as_ref().unwrap().clone();
         let last_checkpoint = TimeStamp::new(
             self.pool
                 .block_on(meta_cli.global_progress_of_task(&task))?,
         );
-        let region = region.clone();
         self.subs
-            .register_region(&region, handle, Some(last_checkpoint));
+            .register_region(&region, handle.clone(), Some(last_checkpoint));
+
+        let region_id = region.get_id();
+        let ob = ChangeObserver::from_cdc(region_id, handle);
+        let snap = init.observe_over(region, ob)?;
+        let region = region.clone();
+
         // Note: Even we did the initial scanning, if the next_backup_ts was updated by periodic flushing,
         //       before the initial scanning done, there is still possibility of losing data:
         //       if the server crashes immediately, and data of this scanning hasn't been sent to sink,
@@ -678,13 +685,26 @@ where
                 }
             }
             ObserveOp::Stop { ref region } => {
-                self.subs.deregister_region(region);
+                self.subs.deregister_region(region, |_, _| true);
+            }
+            ObserveOp::CheckEpochAndStop { ref region } => {
+                self.subs.deregister_region(region, |old, new| {
+                    raftstore::store::util::compare_region_epoch(
+                        old.get_region_epoch(),
+                        new,
+                        true,
+                        true,
+                        false,
+                    )
+                    .map_err(|err| warn!("check epoch and stop failed."; "err" => %err))
+                    .is_ok()
+                });
             }
             ObserveOp::RefreshResolver { ref region } => {
-                let need_refresh_all = self.subs.try_update_region(&region);
+                let need_refresh_all = !self.subs.try_update_region(&region);
 
                 if need_refresh_all {
-                    let canceled = self.subs.deregister_region(region);
+                    let canceled = self.subs.deregister_region(region, |_, _| true);
                     if canceled {
                         let for_task = self.find_task_by_region(&region).unwrap_or_else(|| {
                             panic!(
@@ -765,6 +785,9 @@ pub enum ObserveOp {
         needs_initial_scanning: bool,
     },
     Stop {
+        region: Region,
+    },
+    CheckEpochAndStop {
         region: Region,
     },
     RefreshResolver {
