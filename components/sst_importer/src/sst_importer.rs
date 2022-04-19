@@ -1,12 +1,13 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+use dashmap::DashMap;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::executor::ThreadPool;
 use kvproto::brpb::{CipherInfo, StorageBackend};
@@ -41,6 +42,7 @@ pub struct SSTImporter {
     switcher: ImportModeSwitcher,
     api_version: ApiVersion,
     compression_types: HashMap<CfName, SstCompressionType>,
+    file_locks: DashMap<String, Mutex<()>>,
 }
 
 impl SSTImporter {
@@ -57,6 +59,7 @@ impl SSTImporter {
             switcher,
             api_version,
             compression_types: HashMap::with_capacity(2),
+            file_locks: DashMap::default(),
         })
     }
 
@@ -275,7 +278,17 @@ impl SSTImporter {
         let start = Instant::now();
         let sha256 = meta.get_sha256().to_vec();
         let expected_sha256 = if sha256.len() > 0 { Some(sha256) } else { None };
-
+        if path.save.exists() {
+            return Ok(path.save);
+        }
+        let l = self
+            .file_locks
+            .entry(name.to_string())
+            .or_insert(Mutex::new(()));
+        let _ = l.lock();
+        if path.save.exists() {
+            return Ok(path.save);
+        }
         self.download_file_from_external_storage(
             // don't check file length after download file for now.
             meta.get_length(),
@@ -289,11 +302,14 @@ impl SSTImporter {
         )?;
         info!("download file finished {}", name);
 
+        std::fs::rename(path.temp, path.save.clone())?;
+        self.file_locks.remove(name.clone());
+
         IMPORTER_APPLY_DURATION
             .with_label_values(&["download"])
             .observe(start.saturating_elapsed().as_secs_f64());
 
-        Ok(path.temp)
+        Ok(path.save)
     }
 
     pub fn do_apply_kv_file<P: AsRef<Path>>(
