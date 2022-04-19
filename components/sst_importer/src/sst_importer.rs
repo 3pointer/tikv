@@ -110,6 +110,15 @@ impl SSTImporter {
         }
     }
 
+    pub fn remove_dir(&self, prefix: &str) -> Result<()> {
+        let path = self.dir.get_root_dir().join(prefix);
+        if path.exists() {
+            file_system::remove_dir_all(&path)?;
+            info!("directory {:?} has been removed", path);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, meta: &SstMeta) -> Result<SSTMetaInfo> {
         self.dir.validate(meta, self.key_manager.clone())
     }
@@ -277,15 +286,17 @@ impl SSTImporter {
         let path = self.dir.get_import_path(name)?;
         let start = Instant::now();
         let sha256 = meta.get_sha256().to_vec();
-        let expected_sha256 = if sha256.len() > 0 { Some(sha256) } else { None };
+        let expected_sha256 = if !sha256.is_empty() { Some(sha256) } else { None };
         if path.save.exists() {
             return Ok(path.save);
         }
-        let l = self
+
+        let entry = self
             .file_locks
             .entry(name.to_string())
             .or_insert(Mutex::new(()));
-        let _ = l.lock();
+
+        let lock = entry.lock();
         if path.save.exists() {
             return Ok(path.save);
         }
@@ -303,7 +314,8 @@ impl SSTImporter {
         info!("download file finished {}", name);
 
         std::fs::rename(path.temp, path.save.clone())?;
-        self.file_locks.remove(name.clone());
+        drop(lock);
+        self.file_locks.remove(name);
 
         IMPORTER_APPLY_DURATION
             .with_label_values(&["download"])
@@ -1088,7 +1100,7 @@ mod tests {
         let input_len = input.len() as u64;
 
         let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
-        hasher.update(data);
+        hasher.update(data).unwrap();
         let hash256 = hasher.finish().unwrap().to_vec();
 
         block_on_external_io(external_storage_export::read_external_storage_into_file(

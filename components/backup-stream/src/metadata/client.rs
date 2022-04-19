@@ -205,7 +205,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
                 task_name: name.to_owned(),
             });
         }
-        let info = protobuf::parse_from_bytes::<StreamBackupTaskInfo>(&items[0].value())?;
+        let info = protobuf::parse_from_bytes::<StreamBackupTaskInfo>(items[0].value())?;
         let is_paused = self.check_task_paused(name).await?;
 
         Ok(StreamTask { info, is_paused })
@@ -224,7 +224,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
         let mut tasks = Vec::with_capacity(kvs.len());
         for kv in kvs {
             tasks.push(StreamTask {
-                info: protobuf::parse_from_bytes(&kv.value())?,
+                info: protobuf::parse_from_bytes(kv.value())?,
                 is_paused: pause_hash.contains_key(kv.key()),
             });
         }

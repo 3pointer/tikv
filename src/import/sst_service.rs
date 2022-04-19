@@ -439,6 +439,41 @@ where
         self.threads.spawn_ok(handle_task);
     }
 
+    // clear_files the KV files after apply finished.
+    // it will remove the direcotry in import path.
+    fn clear_files(
+        &mut self,
+        _ctx: RpcContext<'_>,
+        req: ClearRequest,
+        sink: UnarySink<ClearResponse>,
+    ) {
+        let label = "clear_files";
+        let timer = Instant::now_coarse();
+        let importer = Arc::clone(&self.importer);
+        let start = Instant::now();
+        let mut resp = ClearResponse::default();
+
+        let handle_task = async move {
+            // Records how long the apply task waits to be scheduled.
+            sst_importer::metrics::IMPORTER_APPLY_DURATION
+                .with_label_values(&["queue"])
+                .observe(start.saturating_elapsed().as_secs_f64());
+
+            if let Err(e) = importer.remove_dir(req.get_prefix()) {
+                let mut import_err = kvproto::import_sstpb::Error::default();
+                import_err.set_message(format!("failed to remove directory: {}", e));
+                resp.set_error(import_err);
+            }
+            sst_importer::metrics::IMPORTER_APPLY_DURATION
+                .with_label_values(&[label])
+                .observe(start.saturating_elapsed().as_secs_f64());
+
+            let resp = Ok(resp);
+            crate::send_rpc_response!(resp, sink, label, timer);
+        };
+        self.threads.spawn_ok(handle_task);
+    }
+
     // Downloads KV file and performs key-rewrite then apply kv into this tikv store.
     fn apply(
         &mut self,
