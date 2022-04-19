@@ -105,21 +105,6 @@ impl Resolver {
         self.tracked_index = index;
     }
 
-    pub fn destroy_lock_range(&mut self, start_key: &[u8], end_key: &[u8]) {
-        let keys_to_remove = self
-            .locks_by_key
-            .iter()
-            .filter(|(k, _)| {
-                k.as_ref() >= start_key && (end_key.is_empty() || k.as_ref() < end_key)
-            })
-            .map(|(key, v)| (key.clone(), *v))
-            .collect::<Vec<_>>();
-        for (key, ts) in keys_to_remove {
-            self.locks_by_key.remove(&key);
-            self.lock_ts_heap.remove(&ts);
-        }
-    }
-
     pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>, index: Option<u64>) {
         if let Some(index) = index {
             self.update_tracked_index(index);
