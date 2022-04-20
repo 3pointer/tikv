@@ -2,7 +2,6 @@
 
 use std::marker::PhantomData;
 
-use crossbeam::sync::WaitGroup;
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
@@ -18,14 +17,14 @@ use tikv::storage::{
     txn::{EntryBatch, TxnEntry, TxnEntryScanner},
     Snapshot, Statistics,
 };
-use tikv_util::{box_err, info, warn};
+use tikv_util::{box_err, warn};
 use txn_types::{Key, Lock, TimeStamp};
 
 use crate::{
     annotate, debug,
     errors::{ContextualResultExt, Error, Result},
-    observer::{SubscriptionTracer, TwoPhaseResolver},
     router::ApplyEvent,
+    subscription_track::{SubscriptionTracer, TwoPhaseResolver},
     utils::{self, RegionPager},
 };
 use crate::{

@@ -29,8 +29,8 @@ use crate::event_loader::InitialDataLoader;
 use crate::metadata::store::{EtcdStore, MetaStore};
 use crate::metadata::{MetadataClient, MetadataEvent, StreamTask};
 use crate::metrics;
-use crate::observer::SubscriptionTracer;
 use crate::router::{ApplyEvents, Router, FLUSH_STORAGE_INTERVAL};
+use crate::subscription_track::SubscriptionTracer;
 use crate::utils::{self, StopWatch};
 use crate::{errors::Result, observer::BackupStreamObserver};
 
@@ -410,7 +410,6 @@ where
                 "start_key" => utils::redact(&start_key),
                 "end_key" => utils::redact(&end_key),
             );
-            return Ok(());
         }
         tokio::task::spawn_blocking(move || {
             let range_init_result =

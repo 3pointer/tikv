@@ -19,7 +19,7 @@ use crate::{
     errors::Error,
     metadata::StreamTask,
     metrics::SKIP_KV_COUNTER,
-    observer::TwoPhaseResolver,
+    subscription_track::TwoPhaseResolver,
     utils::{self, SegmentMap, Slot, SlotMap, StopWatch},
 };
 
