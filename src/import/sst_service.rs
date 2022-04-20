@@ -168,7 +168,7 @@ where
     // will panic if found duplicated entry during Vec<PutRequest>.
     fn build_apply_request<'a, 'b>(
         raft_size: u64,
-        reqs: &'a mut HashMap<Vec<u8>, Request>,
+        reqs: &'a mut HashMap<Vec<u8>, (Request, u64)>,
         cmd_reqs: &'a mut Vec<RaftCmdRequest>,
         is_delete: bool,
         cf: &'b str,
@@ -185,13 +185,19 @@ where
                 let mut req = Request::default();
                 let mut del = DeleteRequest::default();
 
-                let hk = Key::truncate_ts_for(&k).expect("key without ts").to_vec();
-                del.set_key(k);
+                let (encoded_key, ts) = Key::split_on_ts_for(&k).expect("key without ts");
+                del.set_key(k.clone());
                 del.set_cf(cf.to_string());
                 req.set_cmd_type(CmdType::Delete);
                 req.set_delete(del);
                 req_size += req.compute_size() as u64;
-                reqs.insert(hk, req);
+                if reqs
+                    .get(encoded_key)
+                    .map(|(_, old_ts)| *old_ts < ts.into_inner())
+                    .unwrap_or(true)
+                {
+                    reqs.insert(encoded_key.to_owned(), (req, ts.into_inner()));
+                };
                 if req_size > raft_size / 2 {
                     req_size = 0;
                     let cmd = make_request(reqs, context.clone());
@@ -202,14 +208,21 @@ where
             Box::new(move |k: Vec<u8>, v: Vec<u8>| {
                 let mut req = Request::default();
                 let mut put = PutRequest::default();
-                let hk = Key::truncate_ts_for(&k).expect("key without ts").to_vec();
-                put.set_key(k);
+
+                let (encoded_key, ts) = Key::split_on_ts_for(&k).expect("key without ts");
+                put.set_key(k.clone());
                 put.set_value(v);
                 put.set_cf(cf.to_string());
                 req.set_cmd_type(CmdType::Put);
                 req.set_put(put);
                 req_size += req.compute_size() as u64;
-                reqs.insert(hk, req);
+                if reqs
+                    .get(encoded_key)
+                    .map(|(_, old_ts)| *old_ts < ts.into_inner())
+                    .unwrap_or(true)
+                {
+                    reqs.insert(encoded_key.to_owned(), (req, ts.into_inner()));
+                };
                 if req_size > raft_size / 2 {
                     req_size = 0;
                     let cmd = make_request(reqs, context.clone());
@@ -503,7 +516,7 @@ where
             let result = (|| -> Result<()> {
                 let temp_file =
                     importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter)?;
-                let mut reqs = HashMap::<Vec<u8>, Request>::default();
+                let mut reqs = HashMap::<Vec<u8>, (Request, u64)>::default();
                 let mut cmd_reqs = vec![];
                 let mut build_req_fn = Self::build_apply_request(
                     raft_size.0,
@@ -917,7 +930,7 @@ fn make_request_header(mut context: Context) -> RaftRequestHeader {
     header
 }
 
-fn make_request(reqs: &mut HashMap<Vec<u8>, Request>, context: Context) -> RaftCmdRequest {
+fn make_request(reqs: &mut HashMap<Vec<u8>, (Request, u64)>, context: Context) -> RaftCmdRequest {
     let mut cmd = RaftCmdRequest::default();
     let mut header = make_request_header(context);
     // Set the UUID of header to prevent raftstore batching our requests.
@@ -929,6 +942,7 @@ fn make_request(reqs: &mut HashMap<Vec<u8>, Request>, context: Context) -> RaftC
     cmd.set_requests(
         std::mem::take(reqs)
             .into_values()
+            .map(|(req, _)| req)
             .collect::<Vec<Request>>()
             .into(),
     );

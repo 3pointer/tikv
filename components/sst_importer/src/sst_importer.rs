@@ -42,7 +42,7 @@ pub struct SSTImporter {
     switcher: ImportModeSwitcher,
     api_version: ApiVersion,
     compression_types: HashMap<CfName, SstCompressionType>,
-    file_locks: DashMap<String, Mutex<()>>,
+    file_locks: Arc<DashMap<String, Mutex<()>>>,
 }
 
 impl SSTImporter {
@@ -59,7 +59,7 @@ impl SSTImporter {
             switcher,
             api_version,
             compression_types: HashMap::with_capacity(2),
-            file_locks: DashMap::default(),
+            file_locks: Arc::new(DashMap::default()),
         })
     }
 
@@ -286,20 +286,25 @@ impl SSTImporter {
         let path = self.dir.get_import_path(name)?;
         let start = Instant::now();
         let sha256 = meta.get_sha256().to_vec();
-        let expected_sha256 = if !sha256.is_empty() { Some(sha256) } else { None };
+        let expected_sha256 = if !sha256.is_empty() {
+            Some(sha256)
+        } else {
+            None
+        };
         if path.save.exists() {
             return Ok(path.save);
         }
 
-        let entry = self
+        let lock = self
             .file_locks
             .entry(name.to_string())
             .or_insert(Mutex::new(()));
+        let guard = lock.value().lock().unwrap();
 
-        let lock = entry.lock();
         if path.save.exists() {
             return Ok(path.save);
         }
+
         self.download_file_from_external_storage(
             // don't check file length after download file for now.
             meta.get_length(),
@@ -313,7 +318,13 @@ impl SSTImporter {
         )?;
         info!("download file finished {}", name);
 
-        std::fs::rename(path.temp, path.save.clone())?;
+        if let Some(p) = path.save.parent() {
+            // we have v1 prefix in file name.
+            file_system::create_dir_all(p)?;
+        }
+        file_system::rename(path.temp, path.save.clone())?;
+
+        drop(guard);
         drop(lock);
         self.file_locks.remove(name);
 
@@ -334,7 +345,7 @@ impl SSTImporter {
         build_fn: &mut dyn FnMut(Vec<u8>, Vec<u8>),
     ) -> Result<Option<Range>> {
         // iterator file and performs rewrites and apply.
-        let file = File::open(file_path)?;
+        let file = File::open(&file_path)?;
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer)?;
@@ -352,18 +363,25 @@ impl SSTImporter {
         let mut smallest_key = None;
         let mut largest_key = None;
 
+        let mut total_key = 0;
+        let mut ts_not_expected = 0;
+        let mut not_in_range = 0;
+
         let start = Instant::now();
         loop {
             if !event_iter.valid() {
                 break;
             }
+            total_key += 1;
             event_iter.next()?;
 
+            INPORTER_APPLY_COUNT.with_label_values(&["key_meet"]).inc();
             let ts = Key::decode_ts_from(event_iter.key())?;
             if ts > TimeStamp::new(restore_ts) {
                 // we assume the keys in file are sorted by ts.
                 // so if we met the key not satisfy the ts.
                 // we can easily filter the remain keys.
+                ts_not_expected += 1;
                 break;
             }
             if perform_rewrite {
@@ -394,6 +412,7 @@ impl SSTImporter {
                 INPORTER_APPLY_COUNT
                     .with_label_values(&["key_not_in_region"])
                     .inc();
+                not_in_range += 1;
                 continue;
             }
             let value = event_iter.value().to_vec();
@@ -410,6 +429,10 @@ impl SSTImporter {
                 |v: Vec<u8>| Some(v.max(iter_key.clone())),
             );
         }
+        info!("build download request file done"; "total keys" => %total_key,
+            "ts filtered keys" => %ts_not_expected,
+            "range filtered keys" => %not_in_range,
+            "file" => %file_path.as_ref().display());
 
         let label = if perform_rewrite { "rewrite" } else { "normal" };
         IMPORTER_APPLY_DURATION

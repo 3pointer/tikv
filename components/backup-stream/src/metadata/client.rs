@@ -151,7 +151,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
 
         let s = self.meta_store.snapshot().await?;
         let r = s.get(Keys::Key(key)).await?;
-        if r.len() < 1 {
+        if r.is_empty() {
             return Ok(None);
         }
         let r = &r[0];
@@ -168,10 +168,9 @@ impl<Store: MetaStore> MetadataClient<Store> {
 
     /// pause a task.
     pub async fn pause(&self, name: &str) -> Result<()> {
-        Ok(self
-            .meta_store
+        self.meta_store
             .set(KeyValue(MetaKey::pause_of(name), vec![]))
-            .await?)
+            .await
     }
 
     pub async fn get_tasks_pause_status(&self) -> Result<HashMap<Vec<u8>, bool>> {
