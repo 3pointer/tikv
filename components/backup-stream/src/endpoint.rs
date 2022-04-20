@@ -12,7 +12,6 @@ use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
 
 use error_code::ErrorCodeExt;
-use futures::executor::block_on;
 use kvproto::brpb::StreamBackupError;
 use kvproto::metapb::Region;
 use pd_client::PdClient;
