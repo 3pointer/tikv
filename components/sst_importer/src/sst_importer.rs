@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use futures::executor::ThreadPool;
 use kvproto::brpb::{CipherInfo, StorageBackend};
@@ -42,7 +42,7 @@ pub struct SSTImporter {
     switcher: ImportModeSwitcher,
     api_version: ApiVersion,
     compression_types: HashMap<CfName, SstCompressionType>,
-    file_locks: Arc<DashMap<String, Mutex<()>>>,
+    file_locks: Arc<DashMap<String, ()>>,
 }
 
 impl SSTImporter {
@@ -295,11 +295,7 @@ impl SSTImporter {
             return Ok(path.save);
         }
 
-        let lock = self
-            .file_locks
-            .entry(name.to_string())
-            .or_insert(Mutex::new(()));
-        let guard = lock.value().lock().unwrap();
+        let lock = self.file_locks.entry(name.to_string()).or_default();
 
         if path.save.exists() {
             return Ok(path.save);
@@ -324,7 +320,6 @@ impl SSTImporter {
         }
         file_system::rename(path.temp, path.save.clone())?;
 
-        drop(guard);
         drop(lock);
         self.file_locks.remove(name);
 
