@@ -377,7 +377,7 @@ impl SSTImporter {
                 // so if we met the key not satisfy the ts.
                 // we can easily filter the remain keys.
                 ts_not_expected += 1;
-                break;
+                continue;
             }
             if perform_rewrite {
                 let old_key = event_iter.key();
