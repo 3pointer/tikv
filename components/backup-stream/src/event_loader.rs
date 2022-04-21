@@ -17,7 +17,7 @@ use tikv::storage::{
     txn::{EntryBatch, TxnEntry, TxnEntryScanner},
     Snapshot, Statistics,
 };
-use tikv_util::{box_err, warn};
+use tikv_util::{box_err, time::Instant, warn};
 use txn_types::{Key, Lock, TimeStamp};
 
 use crate::{
@@ -231,12 +231,14 @@ where
         join_handles: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<Statistics> {
         let mut stats = StatisticsSummary::default();
+        let start = Instant::now();
         loop {
             let mut events = ApplyEvents::with_capacity(1024, region.id);
             let stat = self.with_resolver(region.get_id(), |r| {
                 event_loader.scan_batch(1024, &mut events, r)
             })?;
             if events.len() == 0 {
+                metrics::INITIAL_SCAN_DURATION.observe(start.saturating_elapsed_secs());
                 return Ok(stats.stat);
             }
             stats.add_statistics(&stat);

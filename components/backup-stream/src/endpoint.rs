@@ -420,8 +420,6 @@ where
         start_key: Vec<u8>,
         end_key: Vec<u8>,
     ) -> Result<()> {
-        let start_key = start_key;
-        let end_key = end_key;
         let start = Instant::now_coarse();
         let mut start_ts = task.info.get_start_ts();
         // Should scan from checkpoint_ts rather than start_ts if checkpoint_ts exists in Metadata.
@@ -435,7 +433,7 @@ where
             .wl()
             .add((start_key.clone(), end_key.clone()));
         if !success {
-            warn!("task ranges overlapped, which hasn't been supported for now";
+            warn!("backup stream task ranges overlapped, which hasn't been supported for now";
                 "task" => ?task,
                 "start_key" => utils::redact(&start_key),
                 "end_key" => utils::redact(&end_key),
@@ -446,13 +444,13 @@ where
                 init.initialize_range(start_key.clone(), end_key.clone(), TimeStamp::new(start_ts));
             match range_init_result {
                 Ok(stat) => {
-                    info!("success to do initial scanning"; "stat" => ?stat,
+                    info!("backup stream success to do initial scanning"; "stat" => ?stat,
                         "start_key" => utils::redact(&start_key),
                         "end_key" => utils::redact(&end_key),
                         "take" => ?start.saturating_elapsed(),)
                 }
                 Err(e) => {
-                    e.report("failed to initialize regions");
+                    e.report("backup stream do initial scanning successfully");
                 }
             }
         });
