@@ -636,9 +636,10 @@ where
         let init = self.make_initial_loader();
         let handle = ObserveHandle::new();
         let region_id = region.get_id();
-        let ob = ChangeObserver::from_cdc(region_id, handle.clone());
-        self.subs.register_region(&region, handle, None);
-        init.observe_over(region, ob)?;
+        self.subs.register_region(&region, handle.clone(), None);
+        init.observe_over_with_retry(region, || {
+            ChangeObserver::from_cdc(region_id, handle.clone())
+        })?;
         Ok(())
     }
 
@@ -659,8 +660,9 @@ where
             .register_region(&region, handle.clone(), Some(last_checkpoint));
 
         let region_id = region.get_id();
-        let ob = ChangeObserver::from_cdc(region_id, handle);
-        let snap = init.observe_over(region, ob)?;
+        let snap = init.observe_over_with_retry(region, move || {
+            ChangeObserver::from_cdc(region_id, handle.clone())
+        })?;
         let region = region.clone();
 
         // Note: Even we did the initial scanning, if the next_backup_ts was updated by periodic flushing,

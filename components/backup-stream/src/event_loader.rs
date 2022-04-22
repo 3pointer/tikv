@@ -34,6 +34,8 @@ use crate::{
 
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 
+const MAX_GET_SNAPSHOT_RETRY: usize = 3;
+
 /// EventLoader transforms data from the snapshot into ApplyEvent.
 pub struct EventLoader<S: Snapshot> {
     scanner: DeltaScanner<S>,
@@ -153,10 +155,49 @@ where
         }
     }
 
+    pub fn observe_over_with_retry(
+        &self,
+        region: &Region,
+        mut cmd: impl FnMut() -> ChangeObserver,
+    ) -> Result<impl Snapshot> {
+        let mut last_err = None;
+        for _ in 0..MAX_GET_SNAPSHOT_RETRY {
+            let r = self.observe_over(region, cmd());
+            match r {
+                Ok(s) => {
+                    return Ok(s);
+                }
+                Err(e) => {
+                    let can_retry = match e.without_context() {
+                        Error::RaftRequest(pbe) => {
+                            !(pbe.has_epoch_not_match()
+                                || pbe.get_message().contains("stale observe id"))
+                        }
+                        Error::RaftStore(raftstore::Error::RegionNotFound(_)) => false,
+                        _ => true,
+                    };
+                    last_err = match last_err {
+                        None => Some(e),
+                        Some(err) => Some(Error::Contextual {
+                            context: format!("and error {}", e),
+                            inner_error: Box::new(err),
+                        }),
+                    };
+
+                    if !can_retry {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        Err(last_err.expect("BUG: max retry time exceed but no error"))
+    }
+
     /// Start observe over some region.
     /// This will register the region to the raftstore as observing,
     /// and return the current snapshot of that region.
-    pub fn observe_over(&self, region: &Region, cmd: ChangeObserver) -> Result<impl Snapshot> {
+    fn observe_over(&self, region: &Region, cmd: ChangeObserver) -> Result<impl Snapshot> {
         // There are 2 ways for getting the initial snapshot of a region:
         //   1. the BR method: use the interface in the RaftKv interface, read the key-values directly.
         //   2. the CDC method: use the raftstore message `SignificantMsg::CaptureChange` to
@@ -174,7 +215,7 @@ where
                     region_epoch: region.get_region_epoch().clone(),
                     callback: Callback::Read(Box::new(|snapshot| {
                         if snapshot.response.get_header().has_error() {
-                            callback(Err(Error::RaftStore(
+                            callback(Err(Error::RaftRequest(
                                 snapshot.response.get_header().get_error().clone(),
                             )));
                             return;
@@ -189,7 +230,6 @@ where
                     })),
                 },
             )
-            .map_err(|err| Error::Other(Box::new(err)))
             .context(format_args!(
                 "failed to register the observer to region {}",
                 region.get_id()
@@ -285,19 +325,6 @@ where
         stats
     }
 
-    /// Initialize the region: register it to the raftstore and the observer.
-    /// At the same time, perform the initial scanning, (an incremental scanning from `start_ts`)
-    /// and generate the corresponding ApplyEvent to the sink directly.
-    pub fn initialize_region(
-        &self,
-        region: &Region,
-        start_ts: TimeStamp,
-        cmd: ChangeObserver,
-    ) -> Result<Statistics> {
-        let snap = self.observe_over(region, cmd)?;
-        self.do_initial_scan(region, start_ts, snap)
-    }
-
     /// initialize a range: it simply scan the regions with leader role and send them to [`initialize_region`].
     pub fn initialize_range(
         &self,
@@ -315,10 +342,13 @@ where
             }
             for r in regions {
                 let handle = ObserveHandle::new();
-                let ob = ChangeObserver::from_cdc(r.region.get_id(), handle.clone());
                 self.tracing
-                    .register_region(&r.region, handle, Some(start_ts));
-                let stat = self.initialize_region(&r.region, start_ts, ob)?;
+                    .register_region(&r.region, handle.clone(), Some(start_ts));
+                let region_id = r.region.get_id();
+                let snap = self.observe_over_with_retry(&r.region, move || {
+                    ChangeObserver::from_cdc(region_id, handle.clone())
+                })?;
+                let stat = self.do_initial_scan(&r.region, start_ts, snap)?;
                 total_stat.add_statistics(&stat);
             }
         }
