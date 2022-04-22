@@ -450,7 +450,7 @@ where
                         "take" => ?start.saturating_elapsed(),)
                 }
                 Err(e) => {
-                    e.report("backup stream do initial scanning successfully");
+                    e.report("backup stream do initial scanning failed");
                 }
             }
         });
