@@ -297,16 +297,30 @@ where
         let scheduler_clone = scheduler.clone();
 
         Handle::current().spawn(async move {
-            if let Err(err) =
-                Self::starts_watch_task(meta_client_clone, scheduler_clone, revision).await
-            {
-                err.report("failed to start watch tasks");
+            loop {
+                let mut cur_ver = revision;
+                match Self::starts_watch_task(meta_client_clone, scheduler_clone, cur_ver).await {
+                    Ok(v) => {
+                        cur_ver= v;
+                        warn!("backup stream retry watch task"; "task" => ?task, "version" => cur_ver);
+                    }
+                    Err(e) => err.report("failed to start watch tasks"),
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
 
         Handle::current().spawn(async move {
-            if let Err(err) = Self::starts_watch_pause(meta_client, scheduler, revision).await {
-                err.report("failed to start watch pause");
+            loop {
+                let mut cur_ver = revision;
+                match Self::starts_watch_pause(meta_client, scheduler, revision).await {
+                    Ok(v) => {
+                        cur_ver= v;
+                        warn!("backup stream retry watch task"; "task" => ?task, "version" => cur_ver);
+                    }
+                    Err(e) => err.report("failed to start watch pause"),
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
 
@@ -317,11 +331,13 @@ where
         meta_client: MetadataClient<S>,
         scheduler: Scheduler<Task>,
         revision: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let mut watcher = meta_client.events_from(revision).await?;
+        cur_ver = revision;
         loop {
             if let Some(event) = watcher.stream.next().await {
                 info!("backup stream watch event from etcd"; "event" => ?event);
+                cur_ver += 1;
                 match event {
                     MetadataEvent::AddTask { task } => {
                         scheduler.schedule(Task::WatchTask(TaskOp::AddTask(task)))?;
@@ -329,7 +345,10 @@ where
                     MetadataEvent::RemoveTask { task } => {
                         scheduler.schedule(Task::WatchTask(TaskOp::RemoveTask(task)))?;
                     }
-                    MetadataEvent::Error { err } => err.report("metadata client watch meet error"),
+                    MetadataEvent::Error { err } => {
+                        err.report("metadata client watch meet error");
+                        return Ok(cur_ver)
+                    }
                     _ => panic!("BUG: invalid event {:?}", event),
                 }
             }
@@ -340,7 +359,7 @@ where
         meta_client: MetadataClient<S>,
         scheduler: Scheduler<Task>,
         revision: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let mut watcher = meta_client.events_from_pause(revision).await?;
         loop {
             if let Some(event) = watcher.stream.next().await {
@@ -353,7 +372,10 @@ where
                         let task = meta_client.get_task(&task).await?;
                         scheduler.schedule(Task::WatchTask(TaskOp::ResumeTask(task)))?;
                     }
-                    MetadataEvent::Error { err } => err.report("metadata client watch meet error"),
+                    MetadataEvent::Error { err } => {
+                        err.report("metadata client watch meet error"),
+                        return Err(cur_ver)
+                    }
                     _ => panic!("BUG: invalid event {:?}", event),
                 }
             }
