@@ -36,6 +36,8 @@ url = "2.0"
 thiserror = "1.0"
 lazy_static = "1.3"
 prometheus = { version = "0.13", default-features = false, features = ["nightly"] }
+md5 = "0.7.0"
+base64 = "0.13"
 
 [dev-dependencies]
 futures = "0.3"

@@ -23,6 +23,7 @@ use tikv_util::{
     time::Instant,
 };
 use tokio::time::{sleep, timeout};
+use md5;
 
 use crate::util;
 
@@ -492,6 +493,7 @@ impl<'client> S3Uploader<'client> {
                     ssekms_key_id: self.sse_kms_key_id.as_ref().map(|s| s.to_string()),
                     storage_class: self.storage_class.as_ref().map(|s| s.to_string()),
                     content_length: Some(data.len() as i64),
+                    content_md5: Some(base64::encode(md5::compute(data).0)),
                     body: Some(data.to_vec().into()),
                     ..Default::default()
                 })
