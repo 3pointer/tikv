@@ -20,6 +20,7 @@ use kvproto::{
     encryptionpb::EncryptionMethod,
     kvrpcpb::{ApiVersion, Context, IsolationLevel, KeyRange},
     metapb::*,
+    raft_serverpb::{ExtraMessageType, FlushMemtable, RaftMessage},
 };
 use online_config::OnlineConfig;
 use raft::StateRole;
@@ -27,7 +28,7 @@ use raftstore::coprocessor::RegionInfoProvider;
 use tikv::{
     config::BackupConfig,
     storage::{
-        kv::{CursorBuilder, Engine, LocalTablets, ScanMode, SnapContext},
+        kv::{CursorBuilder, Engine, LocalTablets, ScanMode, SnapContext, RaftExtension},
         mvcc::Error as MvccError,
         raw::raw_mvcc::RawMvccSnapshot,
         txn::{EntryBatch, Error as TxnError, SnapshotStore, TxnEntryScanner, TxnEntryStore},
@@ -892,6 +893,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         let backup_ts = request.end_ts;
         let engine = self.engine.clone();
         let tablets = self.tablets.clone();
+        let raft_ext = self.engine.clone().raft_extension();
         let store_id = self.store_id;
         let concurrency_manager = self.concurrency_manager.clone();
         let batch_size = self.config_manager.0.read().unwrap().batch_size;
@@ -956,6 +958,24 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             return;
                         }
                     };
+                    if let LocalTablets::Registry(_) = tablets {
+                        // v2 flush test
+                        info!("backup start flush only"; "region" => ?brange.region.id);
+                        // build and send flush message to this region
+                        let mut msg = RaftMessage::default();
+                        msg.set_region_id(brange.region.id);
+                        msg.set_from_peer(brange.peer.clone());
+                        msg.set_to_peer(brange.peer.clone());
+                        msg.set_region_epoch(brange.region.get_region_epoch().clone());
+                        let extra_msg = msg.mut_extra_msg();
+                        extra_msg.set_type(ExtraMessageType::MsgFlushMemtable);
+                        let mut flush_memtable = FlushMemtable::new();
+                        flush_memtable.set_region_id(brange.region.id);
+                        extra_msg.set_flush_memtable(flush_memtable);
+
+                        raft_ext.feed(msg, true);
+                        info!("backup finish flush"; "region" => ?brange.region.id);
+                    }
 
                     let stat = if is_raw_kv {
                         brange
