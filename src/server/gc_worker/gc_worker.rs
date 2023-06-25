@@ -1300,7 +1300,7 @@ pub mod test_gc_worker {
     use std::sync::{Arc, Mutex};
 
     use collections::HashMap;
-    use engine_rocks::{RocksEngine, RocksSnapshot};
+    use engine_rocks::{RocksEngine, RocksEngineCheckpointer, RocksSnapshot};
     use futures::Future;
     use kvproto::{
         kvrpcpb::Context,
@@ -1331,6 +1331,7 @@ pub mod test_gc_worker {
         // Use RegionSnapshot which can remove the z prefix internally.
         type Snap = RegionSnapshot<RocksSnapshot>;
         type Local = RocksEngine;
+        type Checkpointer = RocksEngineCheckpointer;
 
         fn kv_engine(&self) -> Option<RocksEngine> {
             self.0.kv_engine()
@@ -1424,6 +1425,7 @@ pub mod test_gc_worker {
     impl Engine for MultiRocksEngine {
         type Snap = <PrefixedEngine as Engine>::Snap;
         type Local = <PrefixedEngine as Engine>::Local;
+        type Checkpointer = <PrefixedEngine as Engine>::Checkpointer;
 
         fn kv_engine(&self) -> Option<Self::Local> {
             None

@@ -148,6 +148,7 @@ fn check_expected_write(
 impl Engine for MockEngine {
     type Snap = <RocksEngine as Engine>::Snap;
     type Local = <RocksEngine as Engine>::Local;
+    type Checkpointer = <RocksEngine as Engine>::Checkpointer;
 
     fn kv_engine(&self) -> Option<Self::Local> {
         self.base.kv_engine()

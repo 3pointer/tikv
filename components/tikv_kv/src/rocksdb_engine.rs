@@ -14,7 +14,8 @@ use std::{
 use collections::HashMap;
 pub use engine_rocks::RocksSnapshot;
 use engine_rocks::{
-    get_env, RocksCfOptions, RocksDbOptions, RocksEngine as BaseRocksEngine, RocksEngineIterator,
+    get_env, RocksCfOptions, RocksDbOptions, RocksEngine as BaseRocksEngine,
+    RocksEngineCheckpointer, RocksEngineIterator,
 };
 use engine_traits::{
     CfName, Engines, IterOptions, Iterable, Iterator, KvEngine, Peekable, ReadOptions,
@@ -227,6 +228,7 @@ impl<RE> Debug for RocksEngine<RE> {
 impl<RE: RaftExtension + 'static> Engine for RocksEngine<RE> {
     type Snap = Arc<RocksSnapshot>;
     type Local = BaseRocksEngine;
+    type Checkpointer = RocksEngineCheckpointer;
 
     fn kv_engine(&self) -> Option<BaseRocksEngine> {
         Some(self.engines.kv.clone())

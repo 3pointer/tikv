@@ -133,6 +133,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftKv2<EK, ER> {
 impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
     type Snap = RegionSnapshot<EK::Snapshot>;
     type Local = EK;
+    type Checkpointer = EK::Checkpointer;
 
     #[inline]
     fn kv_engine(&self) -> Option<Self::Local> {

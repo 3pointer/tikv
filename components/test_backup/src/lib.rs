@@ -9,7 +9,7 @@ use std::{
 };
 
 use api_version::{dispatch_api_version, keyspace::KvPair, ApiV1, KvFormat, RawValue};
-use backup::Task;
+use backup::{Operation, Task};
 use collections::HashMap;
 use engine_traits::{CfName, IterOptions, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
 use external_storage_export::make_local_backend;
@@ -40,7 +40,7 @@ use txn_types::TimeStamp;
 
 pub struct TestSuite {
     pub cluster: Cluster<ServerCluster>,
-    pub endpoints: HashMap<u64, LazyWorker<Task>>,
+    pub endpoints: HashMap<u64, LazyWorker<Operation>>,
     pub tikv_cli: TikvClient,
     pub context: Context,
     pub ts: TimeStamp,
@@ -94,6 +94,7 @@ impl TestSuite {
                 },
                 sim.get_concurrency_manager(*id),
                 api_version,
+                String::from("test"),
                 None,
             );
             let mut worker = bg_worker.lazy_build(format!("backup-{}", id));
@@ -301,7 +302,9 @@ impl TestSuite {
         let (tx, rx) = future_mpsc::unbounded();
         for end in self.endpoints.values() {
             let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
-            end.scheduler().schedule(task).unwrap();
+            end.scheduler()
+                .schedule(Operation::BackupTask(task))
+                .unwrap();
         }
         rx
     }
@@ -324,7 +327,9 @@ impl TestSuite {
         let (tx, rx) = future_mpsc::unbounded();
         for end in self.endpoints.values() {
             let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
-            end.scheduler().schedule(task).unwrap();
+            end.scheduler()
+                .schedule(Operation::BackupTask(task))
+                .unwrap();
         }
         rx
     }

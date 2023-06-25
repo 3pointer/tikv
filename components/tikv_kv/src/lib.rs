@@ -36,8 +36,8 @@ use std::{
 
 use collections::HashMap;
 use engine_traits::{
-    CfName, IterOptions, KvEngine as LocalEngine, Mutable, MvccProperties, ReadOptions,
-    TabletRegistry, WriteBatch, CF_DEFAULT, CF_LOCK,
+    CfName, Checkpointer, IterOptions, KvEngine as LocalEngine, Mutable, MvccProperties,
+    ReadOptions, TabletRegistry, WriteBatch, CF_DEFAULT, CF_LOCK,
 };
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use futures::{compat::Future01CompatExt, future::BoxFuture, prelude::*};
@@ -325,6 +325,7 @@ pub struct SnapContext<'a> {
 pub trait Engine: Send + Clone + 'static {
     type Snap: Snapshot;
     type Local: LocalEngine;
+    type Checkpointer: Checkpointer;
 
     /// Local storage engine.
     ///
@@ -335,6 +336,11 @@ pub trait Engine: Send + Clone + 'static {
     type RaftExtension: raft_extension::RaftExtension = FakeExtension;
     /// Get the underlying raft extension.
     fn raft_extension(&self) -> Self::RaftExtension {
+        unimplemented!()
+    }
+
+    /// Get the checkpointer.
+    fn checkpointer(&self) -> Option<Self::Checkpointer> {
         unimplemented!()
     }
 

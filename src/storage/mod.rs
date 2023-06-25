@@ -3093,6 +3093,7 @@ pub struct TxnTestEngine<E: Engine> {
 impl<E: Engine> Engine for TxnTestEngine<E> {
     type Snap = TxnTestSnapshot<E::Snap>;
     type Local = E::Local;
+    type Checkpointer = E::Checkpointer;
 
     fn kv_engine(&self) -> Option<Self::Local> {
         self.engine.kv_engine()

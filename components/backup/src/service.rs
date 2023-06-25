@@ -112,7 +112,7 @@ where
             } else {
                 sink.fail(RpcStatus::with_message(
                     RpcStatusCode::INTERNAL,
-                    format!("prepare recv nothing"),
+                    "prepare recv nothing".to_string(),
                 ));
             };
         };
@@ -145,7 +145,7 @@ where
             } else {
                 sink.fail(RpcStatus::with_message(
                     RpcStatusCode::INTERNAL,
-                    format!("cleanup recv nothing"),
+                    "cleanup recv nothing".to_string(),
                 ));
             };
         };
@@ -220,7 +220,7 @@ mod tests {
     use super::*;
     use crate::endpoint::tests::*;
 
-    fn new_rpc_suite() -> (Server, BackupClient, ReceiverWrapper<Task>) {
+    fn new_rpc_suite() -> (Server, BackupClient, ReceiverWrapper<Operation>) {
         let env = Arc::new(EnvBuilder::new().build());
         let (scheduler, rx) = dummy_scheduler();
         let backup_service = super::Service::<RocksEngine, RocksEngine>::new(scheduler);
@@ -239,7 +239,7 @@ mod tests {
     fn test_client_stop() {
         let (_server, client, mut rx) = new_rpc_suite();
 
-        let (tmp, endpoint) = new_endpoint();
+        let (tmp, mut endpoint) = new_endpoint();
         let mut engine = endpoint.engine.clone();
         endpoint.region_info.set_regions(vec![
             (b"".to_vec(), b"2".to_vec(), 1),
@@ -272,11 +272,11 @@ mod tests {
         req.set_storage_backend(make_local_backend(&tmp.path().join(now.to_string())));
 
         let stream = client.backup(&req).unwrap();
-        let task = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let operation = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         // Drop stream without start receiving will cause cancel error.
         drop(stream);
         // A stopped remote must not cause panic.
-        endpoint.handle_backup_task(task.unwrap());
+        endpoint.run(operation.unwrap());
 
         // Set an unique path to avoid AlreadyExists error.
         req.set_storage_backend(make_local_backend(&tmp.path().join(alloc_ts().to_string())));
@@ -285,14 +285,19 @@ mod tests {
         client.spawn(async move {
             let _ = stream.next().await;
         });
-        let task = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let operation = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         // A stopped remote must not cause panic.
-        endpoint.handle_backup_task(task.unwrap());
+        endpoint.run(operation.unwrap());
 
         // Set an unique path to avoid AlreadyExists error.
         req.set_storage_backend(make_local_backend(&tmp.path().join(alloc_ts().to_string())));
         let stream = client.backup(&req).unwrap();
-        let task = rx.recv().unwrap();
+        let operation = rx.recv().unwrap();
+        let task = if let Operation::BackupTask(task) = operation {
+            task
+        } else {
+            panic!("operation is not backup task: {}", operation)
+        };
         // Drop stream without start receiving will cause cancel error.
         drop(stream);
         // Wait util the task is canceled in map_err.

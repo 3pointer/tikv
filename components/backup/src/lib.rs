@@ -8,6 +8,7 @@ extern crate tikv_alloc;
 mod endpoint;
 mod errors;
 mod metrics;
+mod segment_manager;
 mod service;
 mod softlimit;
 mod utils;

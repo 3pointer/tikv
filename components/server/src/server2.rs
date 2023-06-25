@@ -868,6 +868,7 @@ where
             self.core.config.backup.clone(),
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
+            self.core.config.storage.data_dir.clone(),
             self.causal_ts_provider.clone(),
         );
         self.cfg_controller.as_mut().unwrap().register(

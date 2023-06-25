@@ -547,7 +547,9 @@ dependencies = [
  "tikv_util",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "txn_types",
+ "uuid 0.8.2",
  "yatp",
 ]
 

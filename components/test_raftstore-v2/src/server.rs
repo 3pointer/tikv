@@ -123,6 +123,7 @@ impl<EK: KvEngine> TestRaftKv2<EK> {
 impl<EK: KvEngine> Engine for TestRaftKv2<EK> {
     type Snap = RegionSnapshot<EK::Snapshot>;
     type Local = EK;
+    type Checkpointer = EK::Checkpointer;
 
     fn kv_engine(&self) -> Option<Self::Local> {
         self.raftkv.kv_engine()
